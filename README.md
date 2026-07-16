@@ -1,43 +1,19 @@
-# Postbox — Exactly-Once Agent Mailbox
+# Postbox
 
-Postbox is a message broker purpose-built for agent-to-agent communication.
-It gives every agent a durable, persistent inbox, ties delivery acknowledgment
-to the receiving agent's own workflow checkpoints (not just "the socket
-accepted the bytes"), and routes poisoned messages to dead-letter queues
-instead of retrying forever.
+Postbox is a message broker for agent-to-agent communication. Every agent gets a durable inbox, delivery acknowledgment is tied to the receiving agent's own workflow checkpoints, and messages that keep failing get routed to a dead-letter queue instead of retrying forever.
 
-## What "exactly-once" means here
+## What "exactly-once" actually means here
 
-A naive broker considers a message delivered once the consumer's HTTP call
-returns `200`. But if agent B crashes between receiving the message and
-finishing whatever it was supposed to do with it, that "successful delivery"
-is a lie — the work never happened.
+Most brokers consider a message delivered once the consumer's HTTP call returns `200`. That's fine until agent B crashes between receiving the message and finishing the work it was supposed to trigger. The broker thinks everything went great; the work never happened.
 
-Postbox closes that gap by making acknowledgment **two-phase and checkpoint-bound**:
+Postbox closes that gap by splitting acknowledgment into two phases, the second of which is bound to the consumer's own checkpoint:
 
-1. **Claim** — B's runtime pulls (or is pushed) a message; it's marked
-   `claimed` with a lease and becomes invisible to other consumers, but is
-   NOT removed from the inbox.
-2. **Commit** — B acknowledges only after recording its own durable
-   checkpoint that the message's effect has taken hold. The ack call carries
-   a caller-supplied `checkpoint_token` that Postbox stores as an audit
-   trail — Postbox does not validate the token's meaning, only that one was
-   supplied and is non-empty, enforcing that callers can't ack out of
-   laziness without pointing to *something* durable.
+1. **Claim.** B's runtime pulls (or is pushed) a message. It's marked `claimed` with a lease and hidden from other consumers, but it stays in the inbox.
+2. **Commit.** B acks only after it has durably recorded that the message's effect took hold. The ack carries a caller-supplied `checkpoint_token`, which Postbox stores as an audit trail. Postbox doesn't validate what the token means — only that one was supplied and is non-empty. The point is that you can't ack out of laziness; you have to point at *something* durable.
 
-If a lease expires without a commit (crash, hang), the message becomes
-visible again and is redelivered — this is where **exactly-once** really means
-**at-least-once delivery + idempotent processing**, and Postbox makes that
-honest rather than hiding it: every message carries a stable `message_id`,
-and Postbox's idempotency ledger (`is_committed(mailbox_id, message_id)`)
-lets a consumer check "have I already handled this" before doing expensive
-work, so redelivery after a crash is a no-op rather than double-processing.
+If a lease expires without a commit — crash, hang, whatever — the message becomes visible again and gets redelivered. This is where I should be honest about the term: "exactly-once" is really at-least-once delivery plus idempotent processing, and Postbox doesn't pretend otherwise. Every message carries a stable `message_id`, and the idempotency ledger (`is_committed(mailbox_id, message_id)`) lets a consumer ask "have I already handled this?" before doing expensive work. Redelivery after a crash becomes a no-op instead of double-processing.
 
-**Do not oversell "exactly-once"** as something achievable at the network
-layer alone. It requires: at-least-once delivery from the broker, idempotent
-processing on the consumer, and an idempotency check that is itself durable.
-Postbox provides the first and the third; the consumer must provide the
-second.
+So, the division of labor: exactly-once needs at-least-once delivery from the broker, idempotent processing on the consumer, and an idempotency check that is itself durable. Postbox gives you the first and the third. The second is on you.
 
 ## Architecture
 
@@ -71,39 +47,21 @@ second.
 
 ### Storage
 
-SQLite via `sqlx` in WAL mode; all storage behind a `MailboxStore` trait
-with an in-memory fake for fast unit tests. Every state transition (claim,
-commit, release, dead-letter) is a single SQLite transaction — there is no
-read-then-write race where two consumers could both believe they claimed the
-same message.
+SQLite via `sqlx` in WAL mode. All storage sits behind a `MailboxStore` trait with an in-memory fake for fast unit tests. Every state transition — claim, commit, release, dead-letter — is a single SQLite transaction, so there's no read-then-write window where two consumers could both think they claimed the same message.
 
-Concurrent writers are serialized at the application level via a
-`tokio::sync::Mutex` around the SQLite pool. This removes the SQLite
-concurrency edge cases from the contract and keeps the SQL simple. WAL still
-gives us crash safety.
+Concurrent writers are serialized at the application level with a `tokio::sync::Mutex` around the SQLite pool. That takes SQLite's concurrency edge cases out of the contract entirely and keeps the SQL simple. WAL still gives us crash safety.
 
 ### Lease expiry
 
-A background sweeper task (periodic scan, not one timer per message) wakes up
-at a configurable interval and restores abandoned leases to `pending` without
-bumping `attempt_count`. A single task bounds memory and gives us crash
-recovery for free: a fresh sweeper on startup reclaims whatever expired
-while the process was down.
+A background sweeper (one periodic scan, not a timer per message) wakes on a configurable interval and moves abandoned leases back to `pending` without touching `attempt_count`. A single task keeps memory bounded, and it makes crash recovery free: a fresh sweeper on startup reclaims whatever expired while the process was down.
 
-### Two front ends, no duplicated business logic
+### Two front ends, one core
 
-- **HTTP (axum)** and **gRPC (tonic)** live in `postbox-grpc`. We chose
-  **split ports** because HTTP REST and gRPC have different HTTP versions
-  (1.1 vs 2) that load balancers, proxies, and observability tools treat
-  differently. Splitting keeps the operational story cleaner and avoids the
-  `tower::steer::Steer` indirection needed for multi-protocol single-port
-  serving.
-- **MCP server** (`postbox-mcp`, using `rmcp`) exposes mailbox operations as
-  seven tools and the `mailbox://{agent_id}/pending` resource so an LLM
-  agent can send/check/claim/ack its own messages directly from a chat loop
-  without custom glue.
+HTTP (axum) and gRPC (tonic) both live in `postbox-grpc`. They run on split ports rather than sharing one. HTTP/1.1 and HTTP/2 get treated differently by load balancers, proxies, and observability tooling, so splitting keeps the operational story simple and avoids the `tower::steer::Steer` indirection you'd need for single-port multi-protocol serving.
 
-Both front ends call into `postbox-core` only.
+There's also an MCP server (`postbox-mcp`, built on `rmcp`) that exposes mailbox operations as seven tools plus a `mailbox://{agent_id}/pending` resource. An LLM agent can send, check, claim, and ack its own messages straight from a chat loop without any custom glue.
+
+Both front ends call into `postbox-core` and nothing else.
 
 ## API at a glance
 
@@ -142,12 +100,11 @@ Both front ends call into `postbox-core` only.
 |--------------------------------------|----------|
 | `mailbox://{agent_id}/pending`       | JSON document of visible messages for `agent_id`. |
 
-## A worked two-agent handoff (with a simulated crash)
+## A two-agent handoff, with a crash in the middle
 
-This walkthrough is also runnable as a `pub async fn` test in
-`crates/postbox-core/tests/` (`fifo_ordering_holds_across_redelivery`).
+This walkthrough exists as a runnable test in `crates/postbox-core/tests/` (`fifo_ordering_holds_across_redelivery`), so you can follow along or just run it.
 
-### Step 1: Alice is told to do something
+### 1. Alice gets told to do something
 
 ```
 POST /v1/mailboxes/alice
@@ -157,7 +114,7 @@ POST /v1/mailboxes/alice/send
 → { "message_id": "01HABCDEF...", ... }
 ```
 
-### Step 2: Alice claims the message
+### 2. Alice claims the message
 
 ```
 POST /v1/mailboxes/alice/claim
@@ -165,32 +122,24 @@ POST /v1/mailboxes/alice/claim
 → { "message": { ... }, "lease_expires_at_ms": 1700000005000 }
 ```
 
-Alice's runtime now holds an exclusive lease. No other consumer can see
-this message.
+Alice's runtime now holds an exclusive lease. No other consumer can see this message.
 
-### Step 3: simulate crash — Alice's process dies before committing
+### 3. Crash — Alice dies before committing
 
-Alice pulled the message, started her work, then her process died before
-writing her durable checkpoint. From Postbox's perspective the message is
-still `claimed`; nothing changes until the lease expires.
+Alice pulled the message, started her work, then her process died before writing her durable checkpoint. From Postbox's perspective the message is still `claimed`; nothing changes until the lease expires.
 
-### Step 4: the sweeper reclaims the expired lease
+### 4. The sweeper reclaims the expired lease
 
-After 5 seconds the sweeper wakes up:
+Five seconds later the sweeper wakes up:
 
 ```
 SELECT message_id, lease_expires_at_ms FROM messages
  WHERE status = 'claimed' AND lease_expires_at_ms <= <now>;
 ```
 
-It atomically moves every expired row back to `pending`
-(`status='pending', lease_expires_at_ms=NULL, claimed_by=NULL`). Critically,
-`attempt_count` is **not** incremented here — only when the consumer
-explicitly fails the claim is `attempt_count` bumped.
+It atomically moves every expired row back to `pending` (`status='pending', lease_expires_at_ms=NULL, claimed_by=NULL`). Note that `attempt_count` does **not** get bumped here — it only increments when a consumer explicitly fails a claim.
 
-### Step 5: Alice's restart reclaims the same work
-
-Alice's runtime comes back up and asks for work again:
+### 5. Alice restarts and picks the same work back up
 
 ```
 POST /v1/mailboxes/alice/claim
@@ -198,13 +147,11 @@ POST /v1/mailboxes/alice/claim
 → { "message": { "attempt_count": 2, "message_id": "01HABCDEF...", ... } }
 ```
 
-`attempt_count` is now `2` — this is the second *claim cycle*, not the second
-send. The ULID is still stable.
+`attempt_count` is now `2` — second *claim cycle*, not second send. The ULID hasn't changed.
 
-### Step 6: Alice actually finishes, persists her checkpoint, and commits
+### 6. Alice finishes, persists her checkpoint, then commits
 
-Alice records `"waitpoint:alice:weather-fetch:ok"` in her state store, then
-tells Postbox:
+Alice records `"waitpoint:alice:weather-fetch:ok"` in her own state store, then tells Postbox:
 
 ```
 POST /v1/messages/01HABCDEF.../commit
@@ -213,31 +160,22 @@ POST /v1/messages/01HABCDEF.../commit
 → 204 No Content
 ```
 
-The `checkpoint_token` is opaque to Postbox — it just records it as an audit
-field on the message. The lender of trust here is "the consumer pointed at
-something durable."
+The token is opaque to Postbox — it just gets recorded as an audit field on the message. The trust model is simply that the consumer pointed at something durable before acking.
 
-### Step 7: idempotency check (if the commit reply was lost)
+### 7. Idempotency check, in case the commit reply got lost
 
-If the commit reply got lost on the way back to Alice, her runtime might
-retry. Before re-doing the work, it asks Postbox:
+If the commit reply never made it back to Alice, her runtime might retry. Before redoing the work, it asks:
 
 ```
 GET /v1/mailboxes/alice/committed/01HABCDEF...
 → { "committed": true }
 ```
 
-The idempotency ledger is durable — Postbox commits the
-`(mailbox_id, message_id)` pair inside the same SQLite transaction as the
-`commit()` itself, so once `committed=true` returns, redelivery of the same
-`message_id` is safe to skip.
+The idempotency ledger is durable. The `(mailbox_id, message_id)` pair is written inside the same SQLite transaction as the `commit()` itself, so once you've seen `committed=true`, skipping a redelivery of that `message_id` is safe.
 
-### Step 8: poison path (if it kept crashing)
+### 8. The poison path, if she'd kept crashing
 
-If Alice had crashed 5 times in a row, each `claim` would have bumped
-`attempt_count`. When `attempt_count > max_attempts`, the next `claim` itself
-would dead-letter the message with `poison_reason: "max_attempts_exceeded"`,
-and the DLQ record carries the full failure history:
+Say Alice crashed five times in a row. Each `claim` would have bumped `attempt_count`, and once `attempt_count > max_attempts`, the next `claim` dead-letters the message with `poison_reason: "max_attempts_exceeded"`. The DLQ record carries the full failure history:
 
 ```json
 {
@@ -249,7 +187,7 @@ and the DLQ record carries the full failure history:
 }
 ```
 
-To re-inject for another attempt:
+To re-inject it for another try:
 
 ```
 POST /v1/dead-letters/01HABCDEF.../replay
@@ -260,12 +198,11 @@ POST /v1/dead-letters/01HABCDEF.../replay
     "headers": { "replayed_from": "01HABCDEF...", "replayed_by": "ops" } }
 ```
 
-The original DLQ record is preserved for audit.
+The original DLQ record sticks around for audit.
 
 ## What counts as "poisoned"
 
-A message is dead-lettered on exactly one of three paths. The DLQ record
-distinguishes them via `poison_reason`:
+A message gets dead-lettered on exactly one of three paths, and the DLQ record tells you which via `poison_reason`:
 
 | Path                  | `poison_reason`           | When                                                  |
 |-----------------------|---------------------------|-------------------------------------------------------|
@@ -273,8 +210,7 @@ distinguishes them via `poison_reason`:
 | Consumer refused      | `permanent_failure`       | `release(..., PermanentFailure)` from a consumer      |
 | Bad payload on arrival| `validation_failed`       | `reject_validation(...)` before any claim             |
 
-This way a developer inspecting the DLQ can tell "kept crashing the consumer"
-from "was malformed on arrival" from "consumer looked at it and refused."
+So when you're digging through the DLQ, you can tell "kept crashing the consumer" apart from "was malformed on arrival" apart from "consumer looked at it and said no."
 
 ## Running the binary
 
@@ -286,8 +222,6 @@ cargo run -p postbox -- \
   --sweep-interval 5s
 ```
 
-Flags:
-
 | Flag                 | Default              | Description |
 |----------------------|----------------------|-------------|
 | `--db`               | `sqlite::memory:`    | SQLite URL. Use `sqlite://./postbox.db` for persistence. |
@@ -297,22 +231,18 @@ Flags:
 | `--mcp`              | `off`                | `stdio` to serve MCP over stdin/stdout. |
 | `-v`                 | `info`               | Verbosity (`-v`=debug, `-vv`=trace). |
 
-Environment variables mirror flags with a `POSTBOX_` prefix
-(e.g. `POSTBOX_HTTP=off`).
+Environment variables mirror the flags with a `POSTBOX_` prefix (e.g. `POSTBOX_HTTP=off`).
 
 ### Graceful shutdown
 
-`SIGINT` and `SIGTERM` cause the binary to:
+On `SIGINT` or `SIGTERM` the binary:
 
-1. Stop accepting new HTTP / gRPC connections.
-2. Cancel pending MCP stdio reads.
-3. Drain in-flight state transitions to a quiescent state, persisting any
-   lease updates that were mid-process.
-4. Stop the sweeper last so it can do one final pass before exit.
+1. Stops accepting new HTTP / gRPC connections.
+2. Cancels pending MCP stdio reads.
+3. Drains in-flight state transitions, persisting any lease updates that were mid-process.
+4. Stops the sweeper last, so it gets one final pass before exit.
 
-Everything is a single SQLite transaction per transition, so the worst case
-on ungraceful exit is a loss of in-flight requests already in progress, never
-a torn state mutation.
+Every transition is a single SQLite transaction, so the worst case on an ungraceful exit is losing requests that were still in flight — never a torn state mutation.
 
 ## Testing
 
@@ -320,36 +250,21 @@ a torn state mutation.
 cargo test --workspace
 ```
 
-The integration tests stand up real HTTP and gRPC servers in-process on
-ephemeral ports, real MCP servers via a `tokio::io::duplex` transport, and
-both an in-memory and SQLite-backed `MailboxStore` against the same behavior
-suite.
+The integration tests stand up real HTTP and gRPC servers in-process on ephemeral ports, real MCP servers over a `tokio::io::duplex` transport, and run both the in-memory and SQLite-backed `MailboxStore` against the same behavior suite.
 
-Property tests (`proptest`) exercise the five invariants from the spec:
+Property tests (`proptest`) cover the five invariants from the spec:
 
 1. A message is visible to at most one active claim at a time.
-2. A message transitions `pending -> claimed -> committed` or
-   `pending -> claimed -> pending` (lease expiry, retry) or
-   `-> dead_lettered`, never backward from `committed`, never skipping
-   `claimed`.
-3. `attempt_count` increments exactly once per claim, never on
-   lease-driven visibility restoration alone until re-claimed.
-4. FIFO mailboxes preserve per-sender order even across redeliveries;
-   unordered mailboxes never require it.
-5. A message that reaches `max_attempts` is dead-lettered exactly once and
-   stops being claimable.
+2. A message goes `pending -> claimed -> committed`, or `pending -> claimed -> pending` (lease expiry, retry), or `-> dead_lettered` — never backward from `committed`, never skipping `claimed`.
+3. `attempt_count` increments exactly once per claim, and never on lease-driven visibility restoration alone.
+4. FIFO mailboxes preserve per-sender order even across redeliveries; unordered mailboxes never require it.
+5. A message that hits `max_attempts` is dead-lettered exactly once and stops being claimable.
 
-The concurrency stress test (`concurrent_claimers_never_double_claim_a_message_while_lease_is_active`)
-spawns 16 simultaneous claimers against 100 owed messages and asserts every
-message is committed exactly once.
+There's also a concurrency stress test (`concurrent_claimers_never_double_claim_a_message_while_lease_is_active`) that throws 16 simultaneous claimers at 100 messages and asserts every one is committed exactly once.
 
 ## Out of scope
 
-Multi-broker clustering/replication, pub-sub fan-out (Postbox is
-point-to-point mailbox delivery, not a topic broker),
-authentication/authorization beyond agent-id scoping, and payload encryption
-at rest. Postbox delivers and tracks messages durably; it is not a general
-event bus.
+Multi-broker clustering and replication, pub-sub fan-out (Postbox is point-to-point mailbox delivery, not a topic broker), auth beyond agent-id scoping, and payload encryption at rest. Postbox delivers and tracks messages durably; it's not trying to be a general event bus.
 
 ## License
 
