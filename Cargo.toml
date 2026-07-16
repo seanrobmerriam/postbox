@@ -1,0 +1,89 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/postbox-core",
+    "crates/postbox-grpc",
+    "crates/postbox-mcp",
+    "crates/postbox",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+authors = ["Postbox Contributors"]
+publish = false
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io-util"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Storage
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "sqlite",
+    "macros",
+    "chrono",
+    "migrate",
+] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Domain primitives
+ulid = { version = "1.1", features = ["serde"] }
+bytes = "1.7"
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+humantime-serde = "1.1"
+
+# HTTP/gRPC
+axum = { version = "0.7", features = ["macros"] }
+tonic = { version = "0.12", features = ["transport", "tls", "server"] }
+tonic-build = "0.12"
+tonic-reflection = "0.12"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+prost = "0.13"
+http = "1.1"
+http-body-util = "0.1"
+hyper = { version = "1.4", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# MCP
+rmcp = { version = "0.17", features = ["server", "transport-io", "macros"] }
+schemars = "0.8"
+
+# CLI / config
+clap = { version = "4.5", features = ["derive", "env"] }
+config = { version = "0.14", default-features = false, features = ["toml"] }
+humantime = "2.1"
+
+# Testing
+proptest = "1.5"
+tempfile = "3.10"
+tokio-stream = "0.1"
+
+# Internal
+postbox-core = { path = "crates/postbox-core" }
+postbox-grpc = { path = "crates/postbox-grpc" }
+postbox-mcp = { path = "crates/postbox-mcp" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.dev]
+debug = 1

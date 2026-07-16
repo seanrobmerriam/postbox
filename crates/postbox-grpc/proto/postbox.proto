@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+package postbox.v1;
+
+service PostboxService {
+  rpc EnsureMailbox(EnsureMailboxRequest) returns (EnsureMailboxResponse);
+  rpc GetMailbox(GetMailboxRequest) returns (GetMailboxResponse);
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+  rpc Peek(PeekRequest) returns (PeekResponse);
+  rpc Claim(ClaimRequest) returns (ClaimResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+  rpc RejectValidation(RejectValidationRequest) returns (RejectValidationResponse);
+  rpc IsCommitted(IsCommittedRequest) returns (IsCommittedResponse);
+  rpc ListDeadLetters(ListDeadLettersRequest) returns (ListDeadLettersResponse);
+  rpc ReplayDeadLetter(ReplayDeadLetterRequest) returns (ReplayDeadLetterResponse);
+}
+
+message Mailbox {
+  string agent_id = 1;
+  uint64 capacity = 2;
+  string ordering_mode = 3;   // "fifo" | "unordered"
+  uint32 max_attempts = 4;
+  uint64 lease_duration_ms = 5;
+  uint64 max_payload_bytes = 6;
+}
+
+message Headers {
+  map<string, string> entries = 1;
+}
+
+message Message {
+  string message_id = 1;
+  string mailbox_id = 2;
+  string sender_id = 3;
+  bytes payload = 4;
+  Headers headers = 5;
+  int32 priority = 6;
+  int64 created_at_ms = 7;
+  int64 visible_at_ms = 8;
+  // enum status: 0=pending, 1=claimed, 2=committed, 3=dead_lettered
+  int32 status = 9;
+  uint32 attempt_count = 10;
+  int64 lease_expires_at_ms = 11;
+  string claimed_by = 12;
+  int64 committed_at_ms = 13;
+  string checkpoint_token = 14;
+}
+
+message ClaimResponseMessage {
+  Message message = 1;
+  int64 lease_expires_at_ms = 2;
+}
+
+message EnsureMailboxRequest {
+  string agent_id = 1;
+  uint64 capacity = 2;
+  string ordering_mode = 3;
+  uint32 max_attempts = 4;
+  uint64 lease_duration_ms = 5;
+  uint64 max_payload_bytes = 6;
+}
+message EnsureMailboxResponse { Mailbox mailbox = 1; }
+
+message GetMailboxRequest { string agent_id = 1; }
+message GetMailboxResponse { Mailbox mailbox = 1; }
+
+message SendMessageRequest {
+  string to_agent = 1;
+  string from_agent = 2;
+  bytes payload = 3;
+  Headers headers = 4;
+  int32 priority = 5;
+  uint64 delay_ms = 6;
+}
+message SendMessageResponse { Message message = 1; }
+
+message PeekRequest { string agent_id = 1; uint32 max = 2; }
+message PeekResponse { repeated Message messages = 1; }
+
+message ClaimRequest {
+  string agent_id = 1;
+  string claimer_id = 2;
+  uint64 lease_duration_ms = 3;
+}
+message ClaimResponse { ClaimResponseMessage claim = 1; }
+
+message CommitRequest {
+  string message_id = 1;
+  string claimer_id = 2;
+  string checkpoint_token = 3;
+}
+message CommitResponse {}
+
+message ReleaseRequest {
+  string message_id = 1;
+  string claimer_id = 2;
+  string kind = 3; // "transient" | "permanent"
+  string note = 4;
+}
+message ReleaseResponse {}
+
+message RejectValidationRequest {
+  string message_id = 1;
+  string note = 2;
+}
+message RejectValidationResponse {}
+
+message IsCommittedRequest { string agent_id = 1; string message_id = 2; }
+message IsCommittedResponse { bool committed = 1; }
+
+message ListDeadLettersRequest {
+  string agent_id = 1;
+  string reason = 2; // "" for no filter; otherwise max_attempts_exceeded | permanent_failure | validation_failed
+  uint32 limit = 3;
+}
+message DeadLetter {
+  string message_id = 1;
+  string mailbox_id = 2;
+  string sender_id = 3;
+  bytes payload = 4;
+  Headers headers = 5;
+  int32 priority = 6;
+  int64 created_at_ms = 7;
+  uint32 attempt_count = 8;
+  string poison_reason = 9;
+  int64 dead_lettered_at_ms = 10;
+}
+message ListDeadLettersResponse { repeated DeadLetter dead_letters = 1; }
+
+message ReplayDeadLetterRequest {
+  string message_id = 1;
+  string target_mailbox = 2;
+  string replayed_by = 3;
+}
+message ReplayDeadLetterResponse { Message message = 1; }

@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+*.swp
+.DS_Store
+*.lcov
+coverage/
+.postbox.db
+.postbox.db-*
+.cargo/config.toml
+.idea/
+.vscode/
