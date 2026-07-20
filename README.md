@@ -1,3 +1,5 @@
+<img src="assets/postbox.png" alt="postbox logo" width="1000">
+
 # Postbox
 
 ![Postbox logo](assets/postbox.png)
