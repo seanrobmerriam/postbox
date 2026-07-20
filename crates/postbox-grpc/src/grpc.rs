@@ -62,10 +62,10 @@ fn core_err_to_grpc(e: postbox_core::PostboxError) -> Status {
     use postbox_core::PostboxError::*;
     let code = match &e {
         MailboxNotFound { .. } | MessageNotFound(_) => tonic::Code::NotFound,
-        EmptyCheckpointToken(_)
-        | InvalidAgentId(_)
-        | PayloadTooLarge { .. }
-        | MailboxFull { .. } => tonic::Code::FailedPrecondition,
+        EmptyCheckpointToken(_) | InvalidAgentId(_) | InvalidHeaders(_) | PayloadTooLarge { .. } => {
+            tonic::Code::InvalidArgument
+        }
+        MailboxFull { .. } => tonic::Code::ResourceExhausted,
         AlreadyCommitted(_) => tonic::Code::AlreadyExists,
         MessageNotClaimable { .. } | MessageNotClaimed(_) | NotClaimedByYou { .. } => {
             tonic::Code::FailedPrecondition
@@ -395,6 +395,25 @@ pub async fn serve(store: Arc<dyn MailboxStore>, cfg: GrpcServeConfig) -> anyhow
     Server::builder()
         .add_service(svc)
         .serve(cfg.addr.parse()?)
+        .await?;
+    Ok(())
+}
+
+/// Start the gRPC server with a graceful-shutdown signal. The server stops
+/// accepting new connections when `shutdown` resolves, then drains in-flight
+/// RPCs before returning.
+pub async fn serve_with_shutdown<F>(
+    store: Arc<dyn MailboxStore>,
+    cfg: GrpcServeConfig,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()>,
+{
+    let svc = PostboxGrpc::new(store).into_server();
+    Server::builder()
+        .add_service(svc)
+        .serve_with_shutdown(cfg.addr.parse()?, shutdown)
         .await?;
     Ok(())
 }

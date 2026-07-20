@@ -23,8 +23,8 @@ pub use memory::MemoryStore;
 pub use store::MailboxStore;
 pub use sqlite::SqliteStore;
 pub use types::{
-    validate_agent_id, Claim, DeadLetter, FailureKind, FailureRecord, Mailbox, MailboxConfig,
-    Message, MessageStatus, OrderingMode, PoisonReason, SendRequest,
+    validate_agent_id, validate_headers, Claim, DeadLetter, FailureKind, FailureRecord, Mailbox,
+    MailboxConfig, Message, MessageStatus, OrderingMode, PoisonReason, SendRequest,
 };
 
 #[cfg(test)]

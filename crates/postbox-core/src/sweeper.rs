@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 
 use crate::clock::Clock;
 use crate::store::MailboxStore;
@@ -46,6 +46,7 @@ pub fn spawn<S: MailboxStore + 'static>(
     let stop_clone = stop.clone();
     let handle = tokio::spawn(async move {
         info!(?interval, "postbox sweeper started");
+        let mut consecutive_failures: u32 = 0;
         loop {
             tokio::select! {
                 _ = stop_clone.notified() => {
@@ -55,9 +56,23 @@ pub fn spawn<S: MailboxStore + 'static>(
                 _ = tokio::time::sleep(interval) => {
                     let now = clock.now();
                     match store.sweep_expired_leases(now).await {
-                        Ok(0) => {}
-                        Ok(n) => debug!(reclaimed = n, "postbox sweeper reclaimed expired leases"),
-                        Err(e) => tracing::warn!(error = %e, "postbox sweeper error"),
+                        Ok(0) => { consecutive_failures = 0; }
+                        Ok(n) => {
+                            consecutive_failures = 0;
+                            debug!(reclaimed = n, "postbox sweeper reclaimed expired leases");
+                        }
+                        Err(e) => {
+                            consecutive_failures += 1;
+                            if consecutive_failures == 1 {
+                                warn!(error = %e, "postbox sweeper error");
+                            } else {
+                                error!(
+                                    error = %e,
+                                    consecutive_failures,
+                                    "postbox sweeper repeated errors; stale leases may accumulate"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -78,6 +93,7 @@ pub fn spawn_arc(
     let stop_clone = stop.clone();
     let handle = tokio::spawn(async move {
         info!(?interval, "postbox sweeper started");
+        let mut consecutive_failures: u32 = 0;
         loop {
             tokio::select! {
                 _ = stop_clone.notified() => {
@@ -87,9 +103,23 @@ pub fn spawn_arc(
                 _ = tokio::time::sleep(interval) => {
                     let now = clock.now();
                     match store.sweep_expired_leases(now).await {
-                        Ok(0) => {}
-                        Ok(n) => debug!(reclaimed = n, "postbox sweeper reclaimed expired leases"),
-                        Err(e) => tracing::warn!(error = %e, "postbox sweeper error"),
+                        Ok(0) => { consecutive_failures = 0; }
+                        Ok(n) => {
+                            consecutive_failures = 0;
+                            debug!(reclaimed = n, "postbox sweeper reclaimed expired leases");
+                        }
+                        Err(e) => {
+                            consecutive_failures += 1;
+                            if consecutive_failures == 1 {
+                                warn!(error = %e, "postbox sweeper error");
+                            } else {
+                                error!(
+                                    error = %e,
+                                    consecutive_failures,
+                                    "postbox sweeper repeated errors; stale leases may accumulate"
+                                );
+                            }
+                        }
                     }
                 }
             }

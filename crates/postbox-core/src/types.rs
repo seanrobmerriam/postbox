@@ -429,6 +429,38 @@ impl SendRequest {
     }
 }
 
+pub const MAX_HEADER_COUNT: usize = 100;
+pub const MAX_HEADER_KEY_LEN: usize = 256;
+pub const MAX_HEADER_VALUE_LEN: usize = 8192;
+
+/// Validate message headers: count, key length, and value length limits.
+pub fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), crate::PostboxError> {
+    if headers.len() > MAX_HEADER_COUNT {
+        return Err(crate::PostboxError::InvalidHeaders(format!(
+            "too many headers: {} (max {})",
+            headers.len(),
+            MAX_HEADER_COUNT
+        )));
+    }
+    for (k, v) in headers {
+        if k.len() > MAX_HEADER_KEY_LEN {
+            return Err(crate::PostboxError::InvalidHeaders(format!(
+                "header key too long: {} bytes (max {})",
+                k.len(),
+                MAX_HEADER_KEY_LEN
+            )));
+        }
+        if v.len() > MAX_HEADER_VALUE_LEN {
+            return Err(crate::PostboxError::InvalidHeaders(format!(
+                "header value too long: {} bytes (max {})",
+                v.len(),
+                MAX_HEADER_VALUE_LEN
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Small utility used to validate an agent identifier. We refuse empty
 /// strings and any whitespace, control characters, or absurd lengths so that
 /// storage keys can't be abused.

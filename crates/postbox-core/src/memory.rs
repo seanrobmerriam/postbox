@@ -115,6 +115,7 @@ impl MailboxStore for MemoryStore {
     async fn send(&self, req: SendRequest) -> Result<Message, PostboxError> {
         validate_agent_id(&req.target_mailbox)?;
         validate_agent_id(&req.sender_id)?;
+        crate::types::validate_headers(&req.headers)?;
         if req.payload.is_empty() {
             // We allow empty payloads but the storage does not depend on it.
         }

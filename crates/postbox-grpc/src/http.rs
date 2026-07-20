@@ -30,12 +30,12 @@
 //!
 //! Errors map to HTTP statuses:
 //! - 400 for validation errors (EmptyCheckpointToken, InvalidAgentId,
-//!   PayloadTooLarge)
+//!   PayloadTooLarge, InvalidHeaders)
 //! - 404 for MailboxNotFound, MessageNotFound
 //! - 409 for AlreadyCommitted
 //! - 422 for MessageNotClaimable, MessageNotClaimed, NotClaimedByYou
 //! - 500 for Storage
-//! - 503 for MailboxFull (?)
+//! - 503 for MailboxFull
 //!
 //! Handlers are thin: every state transition is delegated to
 //! `postbox-core`. There is no business logic duplicated here.
@@ -77,11 +77,12 @@ impl IntoResponse for HttpError {
                 }
                 postbox_core::PostboxError::EmptyCheckpointToken(_)
                 | postbox_core::PostboxError::InvalidAgentId(_)
+                | postbox_core::PostboxError::InvalidHeaders(_)
                 | postbox_core::PostboxError::PayloadTooLarge { .. } => {
                     (StatusCode::BAD_REQUEST, "bad_request")
                 }
                 postbox_core::PostboxError::MailboxFull { .. } => {
-                    (StatusCode::TOO_MANY_REQUESTS, "mailbox_full")
+                    (StatusCode::SERVICE_UNAVAILABLE, "mailbox_full")
                 }
                 postbox_core::PostboxError::AlreadyCommitted(_) => {
                     (StatusCode::CONFLICT, "already_committed")
@@ -448,37 +449,12 @@ async fn claim_message(
     State(state): State<AppState>,
     Path(mailbox_id): Path<String>,
     Json(req): Json<ClaimRequest>,
-) -> HttpResult<(StatusCode, Json<ClaimDto>)> {
+) -> HttpResult<Json<Option<ClaimDto>>> {
     validate_agent_id(&mailbox_id)?;
     validate_agent_id(&req.claimer_id)?;
     let lease = Duration::from_millis(req.lease_duration_ms.unwrap_or(60_000));
     let claim = state.store.claim(&mailbox_id, &req.claimer_id, lease).await?;
-    match claim {
-        Some(c) => Ok((StatusCode::OK, Json(c.into()))),
-        None => Ok((
-            StatusCode::NO_CONTENT,
-            Json(ClaimDto {
-                message: postbox_core::Message {
-                    message_id: Ulid::nil(),
-                    mailbox_id: String::new(),
-                    sender_id: String::new(),
-                    payload: Bytes::new(),
-                    headers: BTreeMap::new(),
-                    priority: 0,
-                    created_at: std::time::SystemTime::UNIX_EPOCH,
-                    visible_at: std::time::SystemTime::UNIX_EPOCH,
-                    status: postbox_core::MessageStatus::Pending,
-                    attempt_count: 0,
-                    lease_expires_at: None,
-                    claimed_by: None,
-                    committed_at: None,
-                    checkpoint_token: None,
-                }
-                .into(),
-                lease_expires_at_ms: 0,
-            }),
-        )),
-    }
+    Ok(Json(claim.map(ClaimDto::from)))
 }
 
 async fn commit_message(

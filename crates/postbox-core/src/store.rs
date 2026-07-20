@@ -70,11 +70,11 @@ pub trait MailboxStore: Send + Sync + 'static {
     ) -> Result<(), PostboxError>;
 
     /// Release a claimed message with a failure classification.
-    /// - `Transient`: lease is cleared, message returns to `pending`, no
-    ///   `attempt_count` bump (the consumer didn't claim it this round).
-    ///   Actually wait: a release after a successful claim ends one claim
-    ///   cycle, and `attempt_count` must reflect that cycle. See the
-    ///   implementation spec for invariants 2 and 3.
+    /// - `Transient`: the lease is cleared and the message returns to
+    ///   `pending`. `attempt_count` is not changed here — it was already
+    ///   incremented when the message was claimed. The count therefore
+    ///   accurately reflects "number of completed claim cycles" including
+    ///   this one.
     /// - `Permanent`: message is moved to the DLQ immediately, regardless of
     ///   `max_attempts`.
     async fn release(

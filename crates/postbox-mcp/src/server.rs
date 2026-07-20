@@ -24,6 +24,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Maximum number of messages returned by the `mailbox://{agent_id}/pending`
+/// resource. Clients needing pagination should use the `check_inbox` tool.
+const MAX_RESOURCE_PEEK: usize = 1000;
+
 use bytes::Bytes;
 use postbox_core::{
     validate_agent_id, FailureKind, MailboxStore, PoisonReason, SendRequest,
@@ -91,7 +95,7 @@ impl PostboxMcp {
         validate_agent_id(&agent_id).map_err(err_to_mcp)?;
         let messages = self
             .store
-            .peek(&agent_id, 1000)
+            .peek(&agent_id, MAX_RESOURCE_PEEK)
             .await
             .map_err(err_to_mcp)?;
         let arr: Vec<serde_json::Value> = messages.iter().map(message_to_json).collect();
@@ -216,6 +220,7 @@ fn err_to_mcp(e: postbox_core::PostboxError) -> rmcp::ErrorData {
         | postbox_core::PostboxError::MessageNotFound(_) => ErrorCode::RESOURCE_NOT_FOUND,
         postbox_core::PostboxError::EmptyCheckpointToken(_)
         | postbox_core::PostboxError::InvalidAgentId(_)
+        | postbox_core::PostboxError::InvalidHeaders(_)
         | postbox_core::PostboxError::PayloadTooLarge { .. }
         | postbox_core::PostboxError::MailboxFull { .. } => ErrorCode::INVALID_PARAMS,
         postbox_core::PostboxError::AlreadyCommitted(_)

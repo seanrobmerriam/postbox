@@ -352,6 +352,7 @@ impl MailboxStore for SqliteStore {
         let _g = self.write_lock.lock().await;
         validate_agent_id(&req.target_mailbox)?;
         validate_agent_id(&req.sender_id)?;
+        crate::types::validate_headers(&req.headers)?;
         let mut tx = self
             .pool
             .begin()
@@ -626,7 +627,9 @@ impl MailboxStore for SqliteStore {
             .map(Self::row_to_message)
             .collect::<Result<_, _>>()?;
         if messages.is_empty() {
-            tx.commit().await.ok();
+            tx.commit()
+                .await
+                .map_err(|e| PostboxError::Storage(format!("commit claim (empty): {e}")))?;
             return Ok(None);
         }
         if matches!(ordering_mode, OrderingMode::Fifo) {
@@ -670,7 +673,9 @@ impl MailboxStore for SqliteStore {
         .await
         .map_err(|e| PostboxError::Storage(format!("claim update: {e}")))?;
         if updated.rows_affected() == 0 {
-            tx.commit().await.ok();
+            tx.commit()
+                .await
+                .map_err(|e| PostboxError::Storage(format!("commit claim (no rows): {e}")))?;
             return Ok(None);
         }
 
@@ -721,7 +726,9 @@ impl MailboxStore for SqliteStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| PostboxError::Storage(format!("dlq remove: {e}")))?;
-            tx.commit().await.ok();
+            tx.commit()
+                .await
+                .map_err(|e| PostboxError::Storage(format!("commit claim (dlq): {e}")))?;
             return Ok(None);
         }
 

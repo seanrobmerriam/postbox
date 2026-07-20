@@ -135,5 +135,5 @@ async fn grpc_commit_with_empty_checkpoint_token_fails() {
         })
         .await
         .unwrap_err();
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }

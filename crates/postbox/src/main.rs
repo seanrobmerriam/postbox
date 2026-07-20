@@ -122,6 +122,9 @@ async fn main() -> Result<()> {
     );
     let store: Arc<dyn MailboxStore> = sqlite_store.clone();
 
+    // Shutdown broadcast: sending `true` tells HTTP and gRPC to drain and exit.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     // Sweeper.
     let sweeper_handle = if let Some(interval) = config.sweep_interval {
         let store_for_sweeper: Arc<dyn MailboxStore> = store.clone();
@@ -138,8 +141,10 @@ async fn main() -> Result<()> {
             .await
             .with_context(|| format!("failed to bind HTTP address {addr}"))?;
         info!(addr = %addr, "HTTP listening");
+        let mut rx = shutdown_rx.clone();
         let handle = tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
+            let shutdown_fut = async move { rx.changed().await.ok(); };
+            if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(shutdown_fut).await {
                 tracing::error!(error = %e, "HTTP server exited with error");
             }
         });
@@ -153,9 +158,15 @@ async fn main() -> Result<()> {
     let grpc_handle = if let Some(addr) = config.grpc.clone() {
         info!(addr = %addr, "gRPC listening");
         let store_for_grpc = store.clone();
+        let mut rx = shutdown_rx.clone();
         let handle = tokio::spawn(async move {
-            if let Err(e) =
-                postbox_grpc::grpc::serve(store_for_grpc, postbox_grpc::grpc::GrpcServeConfig::from_addr(addr)).await
+            let shutdown_fut = async move { rx.changed().await.ok(); };
+            if let Err(e) = postbox_grpc::grpc::serve_with_shutdown(
+                store_for_grpc,
+                postbox_grpc::grpc::GrpcServeConfig::from_addr(addr),
+                shutdown_fut,
+            )
+            .await
             {
                 tracing::error!(error = %e, "gRPC server exited with error");
             }
@@ -184,16 +195,22 @@ async fn main() -> Result<()> {
 
     // Wait for signal.
     wait_for_shutdown().await;
-    info!("shutdown signal received; stopping");
+    info!("shutdown signal received; draining servers");
 
-    // Stop the servers gracefully.
+    // Signal HTTP and gRPC to stop accepting new connections and drain.
+    let _ = shutdown_tx.send(true);
+
+    // Give servers up to 10 s to drain in-flight requests before we give up.
+    let drain_timeout = Duration::from_secs(10);
     if let Some(h) = http_handle {
-        h.abort();
-        let _ = h.await;
+        if tokio::time::timeout(drain_timeout, h).await.is_err() {
+            warn!("HTTP server did not drain within timeout; forcing stop");
+        }
     }
     if let Some(h) = grpc_handle {
-        h.abort();
-        let _ = h.await;
+        if tokio::time::timeout(drain_timeout, h).await.is_err() {
+            warn!("gRPC server did not drain within timeout; forcing stop");
+        }
     }
     if let Some(h) = mcp_handle {
         h.abort();

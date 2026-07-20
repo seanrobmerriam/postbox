@@ -48,6 +48,9 @@ pub enum PostboxError {
     #[error("invalid agent id: {0}")]
     InvalidAgentId(String),
 
+    #[error("invalid headers: {0}")]
+    InvalidHeaders(String),
+
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -68,6 +71,7 @@ impl PostboxError {
                 | PostboxError::AlreadyCommitted(_)
                 | PostboxError::EmptyCheckpointToken(_)
                 | PostboxError::InvalidAgentId(_)
+                | PostboxError::InvalidHeaders(_)
         )
     }
 }
