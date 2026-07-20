@@ -1,3 +1,4 @@
+<img src="postbox2.png" alt="postbox logo" width="1200">   
 # Postbox
 
 Postbox is a message broker for agent-to-agent communication. Every agent gets a durable inbox, delivery acknowledgment is tied to the receiving agent's own workflow checkpoints, and messages that keep failing get routed to a dead-letter queue instead of retrying forever.
