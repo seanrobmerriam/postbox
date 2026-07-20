@@ -1,9 +1,10 @@
 <img src="assets/postbox2.png" alt="postbox logo" width="1200">   
+
 # Postbox
 
 Postbox is a message broker for agent-to-agent communication. Every agent gets a durable inbox, delivery acknowledgment is tied to the receiving agent's own workflow checkpoints, and messages that keep failing get routed to a dead-letter queue instead of retrying forever.
 
-## What "exactly-once" actually means here
+## Overview
 
 Most brokers consider a message delivered once the consumer's HTTP call returns `200`. That's fine until agent B crashes between receiving the message and finishing the work it was supposed to trigger. The broker thinks everything went great; the work never happened.
 
