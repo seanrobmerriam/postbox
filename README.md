@@ -1,4 +1,4 @@
-<img src="assets/postbox2.png" alt="postbox logo" width="1200">   
+<img src="assets/postbox2.png" alt="postbox logo" width="800">   
 
 # Postbox
 
