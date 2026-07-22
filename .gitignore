@@ -10,3 +10,5 @@ coverage/
 .cargo/config.toml
 .idea/
 .vscode/
+# Local design notes (kept on disk but untracked)
+FEATURE_PLAN.md
