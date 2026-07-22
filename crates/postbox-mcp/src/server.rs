@@ -1,6 +1,6 @@
 //! MCP server over `postbox-core`, using `rmcp`.
 //!
-//! Exposes seven tools and one resource template:
+//! Exposes eleven tools and one resource template:
 //!
 //! ## Tools
 //!
@@ -11,6 +11,10 @@
 //! - `release_message`      — release with transient or permanent failure
 //! - `list_dead_letters`   — list DLQ records for a mailbox
 //! - `replay_dead_letter`   — re-inject a dead-letter with attempt_count reset
+//! - `fanout_message`       — atomically send one message to multiple mailboxes
+//! - `list_mailboxes`       — paginated read-only listing of all mailboxes
+//! - `mailbox_stats`        — counters per mailbox (pending/claimed/etc.)
+//! - `purge_dead_letters`   — operator-triggered DLQ purge before a timestamp
 //!
 //! ## Resource
 //!
@@ -30,7 +34,7 @@ const MAX_RESOURCE_PEEK: usize = 1000;
 
 use bytes::Bytes;
 use postbox_core::{
-    validate_agent_id, FailureKind, MailboxStore, PoisonReason, SendRequest,
+    validate_agent_id, FailureKind, FanoutRequest, MailboxStore, PoisonReason, SendRequest,
 };
 use rmcp::{
     handler::server::tool::ToolRouter, handler::server::wrapper::Parameters, model::*,
@@ -43,7 +47,10 @@ use ulid::Ulid;
 /// MCP server adapter over a [`MailboxStore`].
 #[derive(Clone)]
 pub struct PostboxMcp {
-    store: Arc<dyn MailboxStore>,
+    /// Underlying store; exposed so tests and embedders can drive
+    /// `ensure_mailbox` and other lifecycle calls without going through
+    /// the MCP tool surface.
+    pub store: Arc<dyn MailboxStore>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -124,6 +131,10 @@ pub struct SendMessageArgs {
     pub headers: std::collections::BTreeMap<String, String>,
     pub delay_ms: Option<u64>,
     pub from_agent: Option<String>,
+    pub priority: Option<i32>,
+    /// Time-to-live in milliseconds. When set, the sweeper moves the
+    /// message to the DLQ if not claimed before the deadline.
+    pub ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -170,6 +181,41 @@ pub struct ReplayDeadLetterArgs {
     pub replayed_by: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct FanoutMessageArgs {
+    /// Target mailbox agent IDs. Messages are inserted atomically: if any
+    /// target is at capacity or rejects the payload, no mailbox receives
+    /// the message.
+    pub targets: Vec<String>,
+    pub from_agent: String,
+    /// Base64-encoded payload.
+    pub payload_base64: String,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    pub priority: Option<i32>,
+    pub delay_ms: Option<u64>,
+    pub ttl_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ListMailboxesArgs {
+    pub limit: Option<usize>,
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MailboxStatsArgs {
+    pub agent_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct PurgeDeadLettersArgs {
+    pub mailbox_id: String,
+    /// Unix epoch milliseconds. DLQ records with `dead_lettered_at_ms < before_ms`
+    /// are removed.
+    pub before_ms: i64,
+}
+
 // --- Serialization helpers --------------------------------------------------
 
 fn message_to_json(m: &postbox_core::Message) -> serde_json::Value {
@@ -186,6 +232,7 @@ fn message_to_json(m: &postbox_core::Message) -> serde_json::Value {
         "status": format!("{:?}", m.status).to_lowercase(),
         "attempt_count": m.attempt_count,
         "lease_expires_at_ms": m.lease_expires_at.map(postbox_core::types::system_time_to_millis),
+        "expires_at_ms": m.expires_at.map(postbox_core::types::system_time_to_millis),
         "claimed_by": m.claimed_by,
         "committed_at_ms": m.committed_at.map(postbox_core::types::system_time_to_millis),
         "checkpoint_token": m.checkpoint_token,
@@ -267,8 +314,9 @@ impl PostboxMcp {
             sender_id: from,
             payload: Bytes::from(payload),
             headers: args.headers,
-            priority: 0,
+            priority: args.priority.unwrap_or(0),
             delay: args.delay_ms.map(Duration::from_millis),
+            ttl: args.ttl_ms.map(Duration::from_millis),
         };
         let m = self.store.send(req).await.map_err(err_to_mcp)?;
         let body = message_to_json(&m);
@@ -407,6 +455,106 @@ impl PostboxMcp {
             .await
             .map_err(err_to_mcp)?;
         Ok(CallToolResult::success(vec![Content::json(message_to_json(&m))?]))
+    }
+
+    #[tool(description = "Send one message atomically to multiple mailboxes. If any target is at capacity or rejects the payload, no mailbox receives the message.")]
+    pub async fn fanout_message(
+        &self,
+        Parameters(args): Parameters<FanoutMessageArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        use base64::Engine;
+        for t in &args.targets {
+            validate_agent_id(t).map_err(err_to_mcp)?;
+        }
+        validate_agent_id(&args.from_agent).map_err(err_to_mcp)?;
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(&args.payload_base64)
+            .map_err(|e| rmcp::ErrorData::invalid_params(format!("base64: {e}"), None))?;
+        let req = FanoutRequest {
+            targets: args.targets,
+            sender_id: args.from_agent,
+            payload: Bytes::from(payload),
+            headers: args.headers,
+            priority: args.priority.unwrap_or(0),
+            delay: args.delay_ms.map(Duration::from_millis),
+            ttl: args.ttl_ms.map(Duration::from_millis),
+        };
+        let messages = self.store.fanout_send(req).await.map_err(err_to_mcp)?;
+        let arr: Vec<serde_json::Value> = messages.iter().map(message_to_json).collect();
+        Ok(CallToolResult::success(vec![Content::json(json!({
+            "messages": arr
+        }))?]))
+    }
+
+    #[tool(description = "List mailboxes with cursor-based pagination on agent_id. Returns agent_id-sorted mailboxes.")]
+    pub async fn list_mailboxes(
+        &self,
+        Parameters(args): Parameters<ListMailboxesArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let limit = args.limit.unwrap_or(100);
+        let after = args.after.as_deref();
+        let mailboxes = self
+            .store
+            .list_mailboxes(limit, after)
+            .await
+            .map_err(err_to_mcp)?;
+        let arr: Vec<serde_json::Value> = mailboxes
+            .iter()
+            .map(|m| {
+                json!({
+                    "agent_id": m.agent_id,
+                    "capacity": m.capacity,
+                    "ordering_mode": format!("{:?}", m.ordering_mode).to_lowercase(),
+                    "max_attempts": m.max_attempts,
+                    "lease_duration_ms": m.lease_duration.as_millis() as u64,
+                    "max_payload_bytes": m.max_payload_bytes,
+                    "dlq_retention_ms": m.dlq_retention.map(|d| d.as_millis() as u64),
+                    "created_at_ms": postbox_core::types::system_time_to_millis(m.created_at),
+                })
+            })
+            .collect();
+        Ok(CallToolResult::success(vec![Content::json(json!({
+            "mailboxes": arr
+        }))?]))
+    }
+
+    #[tool(description = "Return pending/claimed/committed/dead-lettered counts and the oldest pending timestamp for a mailbox.")]
+    pub async fn mailbox_stats(
+        &self,
+        Parameters(args): Parameters<MailboxStatsArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        validate_agent_id(&args.agent_id).map_err(err_to_mcp)?;
+        let stats = self
+            .store
+            .mailbox_stats(&args.agent_id)
+            .await
+            .map_err(err_to_mcp)?;
+        Ok(CallToolResult::success(vec![Content::json(json!({
+            "agent_id": stats.agent_id,
+            "pending_count": stats.pending_count,
+            "claimed_count": stats.claimed_count,
+            "committed_count": stats.committed_count,
+            "dead_lettered_count": stats.dead_lettered_count,
+            "oldest_pending_at_ms": stats.oldest_pending_at.map(postbox_core::types::system_time_to_millis),
+        }))?]))
+    }
+
+    #[tool(description = "Delete all DLQ records for the mailbox with `dead_lettered_at_ms < before_ms`. Returns the deleted count.")]
+    pub async fn purge_dead_letters(
+        &self,
+        Parameters(args): Parameters<PurgeDeadLettersArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        use std::time::{Duration, UNIX_EPOCH};
+        validate_agent_id(&args.mailbox_id).map_err(err_to_mcp)?;
+        let before = UNIX_EPOCH + Duration::from_millis(args.before_ms.max(0) as u64);
+        let deleted = self
+            .store
+            .purge_dead_letters(&args.mailbox_id, before)
+            .await
+            .map_err(err_to_mcp)?;
+        Ok(CallToolResult::success(vec![Content::json(json!({
+            "deleted_count": deleted
+        }))?]))
     }
 }
 

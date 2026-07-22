@@ -20,8 +20,8 @@ use crate::clock::Clock;
 use crate::error::PostboxError;
 use crate::store::MailboxStore;
 use crate::types::{
-    validate_agent_id, Claim, DeadLetter, FailureKind, FailureRecord, Mailbox, MailboxConfig,
-    Message, MessageStatus, OrderingMode, PoisonReason, SendRequest,
+    validate_agent_id, Claim, DeadLetter, FailureKind, FailureRecord, FanoutRequest, Mailbox,
+    MailboxConfig, MailboxStats, Message, MessageStatus, OrderingMode, PoisonReason, SendRequest,
 };
 
 /// Convert the `Clock`'s `SystemTime` to a sortable `i64` millisecond epoch.
@@ -101,6 +101,7 @@ impl MailboxStore for MemoryStore {
             max_attempts: config.max_attempts,
             lease_duration: config.lease_duration,
             max_payload_bytes: config.max_payload_bytes,
+            dlq_retention: config.dlq_retention,
             created_at: self.clock.now(),
         };
         state.mailboxes.insert(m.agent_id.clone(), m.clone());
@@ -134,6 +135,7 @@ impl MailboxStore for MemoryStore {
                 max_attempts: cfg.max_attempts,
                 lease_duration: cfg.lease_duration,
                 max_payload_bytes: cfg.max_payload_bytes,
+                dlq_retention: None,
                 created_at: self.clock.now(),
             };
             state.mailboxes.insert(m.agent_id.clone(), m.clone());
@@ -171,6 +173,7 @@ impl MailboxStore for MemoryStore {
         let created_at = now;
         let visible_at = req.delay.map(|d| now + d).unwrap_or(now);
         let message_id = self.next_ulid();
+        let expires_at = req.ttl.map(|d| now + d);
 
         let msg = Message {
             message_id,
@@ -187,8 +190,10 @@ impl MailboxStore for MemoryStore {
             claimed_by: None,
             committed_at: None,
             checkpoint_token: None,
+            expires_at,
         };
         state.messages.insert(message_id, msg.clone());
+        crate::metrics::record_send(&mailbox.agent_id);
         Ok(msg)
     }
 
@@ -218,6 +223,7 @@ impl MailboxStore for MemoryStore {
             .collect();
         // Order per the mailbox's mode. FIFO: oldest sender first, then
         // within sender by created_at. Unordered: globally oldest first.
+        // Priority: highest priority first, then created_at ASC, then message_id ASC.
         match mailbox.ordering_mode {
             OrderingMode::Fifo => {
                 out.sort_by(|a, b| {
@@ -231,6 +237,14 @@ impl MailboxStore for MemoryStore {
                 out.sort_by(|a, b| {
                     a.created_at
                         .cmp(&b.created_at)
+                        .then(a.message_id.cmp(&b.message_id))
+                });
+            }
+            OrderingMode::Priority => {
+                out.sort_by(|a, b| {
+                    b.priority
+                        .cmp(&a.priority)
+                        .then(a.created_at.cmp(&b.created_at))
                         .then(a.message_id.cmp(&b.message_id))
                 });
             }
@@ -330,6 +344,14 @@ impl MailboxStore for MemoryStore {
                         .then(a.message_id.cmp(&b.message_id))
                 });
             }
+            OrderingMode::Priority => {
+                candidates.sort_by(|a, b| {
+                    b.priority
+                        .cmp(&a.priority)
+                        .then(a.created_at.cmp(&b.created_at))
+                        .then(a.message_id.cmp(&b.message_id))
+                });
+            }
         }
 
         let target = candidates.into_iter().next().unwrap();
@@ -342,6 +364,7 @@ impl MailboxStore for MemoryStore {
         entry.lease_expires_at = Some(lease_expires_at);
         entry.claimed_by = Some(claimer_id.to_string());
 
+        crate::metrics::record_claim(mailbox_id);
         Ok(Some(Claim {
             message: entry.clone(),
             lease_expires_at,
@@ -394,6 +417,7 @@ impl MailboxStore for MemoryStore {
         entry.checkpoint_token = Some(checkpoint_token.to_string());
         entry.lease_expires_at = None;
         entry.claimed_by = None;
+        crate::metrics::record_commit(&m.mailbox_id);
         state
             .idempotency
             .insert((m.mailbox_id, m.message_id));
@@ -617,6 +641,7 @@ impl MailboxStore for MemoryStore {
             claimed_by: None,
             committed_at: None,
             checkpoint_token: None,
+            expires_at: None,
         };
         state.messages.insert(new_id, replayed.clone());
         Ok(replayed)
@@ -668,6 +693,242 @@ impl MailboxStore for MemoryStore {
                     )
             })
             .count())
+    }
+
+    async fn fanout_send(
+        &self,
+        req: FanoutRequest,
+    ) -> Result<Vec<Message>, PostboxError> {
+        // Validate all targets and sender up front.
+        for t in &req.targets {
+            validate_agent_id(t)?;
+        }
+        validate_agent_id(&req.sender_id)?;
+        crate::types::validate_headers(&req.headers)?;
+
+        let mut state = self.state.lock();
+
+        // Ensure all mailboxes exist (implicit create with defaults) and
+        // run all checks before inserting anything (atomicity).
+        let mut mailboxes: Vec<Mailbox> = Vec::with_capacity(req.targets.len());
+        for t in &req.targets {
+            let mailbox = if let Some(m) = state.mailboxes.get(t) {
+                m.clone()
+            } else {
+                let cfg = MailboxConfig::defaults_for(t.clone());
+                let m = Mailbox {
+                    agent_id: cfg.agent_id.clone(),
+                    capacity: cfg.capacity,
+                    ordering_mode: cfg.ordering_mode,
+                    max_attempts: cfg.max_attempts,
+                    lease_duration: cfg.lease_duration,
+                    max_payload_bytes: cfg.max_payload_bytes,
+                    dlq_retention: None,
+                    created_at: self.clock.now(),
+                };
+                state.mailboxes.insert(m.agent_id.clone(), m.clone());
+                m
+            };
+            mailboxes.push(mailbox);
+        }
+
+        // Check payload size against all mailboxes.
+        for mailbox in &mailboxes {
+            if req.payload.len() > mailbox.max_payload_bytes {
+                return Err(PostboxError::PayloadTooLarge {
+                    size: req.payload.len(),
+                    max: mailbox.max_payload_bytes,
+                });
+            }
+        }
+
+        // Check capacity for all mailboxes.
+        for mailbox in &mailboxes {
+            let active = state
+                .messages
+                .values()
+                .filter(|m| {
+                    m.mailbox_id == mailbox.agent_id
+                        && matches!(
+                            m.status,
+                            MessageStatus::Pending | MessageStatus::Claimed
+                        )
+                })
+                .count();
+            if active >= mailbox.capacity {
+                return Err(PostboxError::MailboxFull {
+                    agent_id: mailbox.agent_id.clone(),
+                    size: active,
+                    capacity: mailbox.capacity,
+                });
+            }
+        }
+
+        // All checks passed — insert one message per target.
+        let now = self.clock.now();
+        let visible_at = req.delay.map(|d| now + d).unwrap_or(now);
+        let expires_at = req.ttl.map(|d| now + d);
+
+        let mut messages: Vec<Message> = Vec::with_capacity(req.targets.len());
+        for (i, mailbox) in mailboxes.iter().enumerate() {
+            let message_id = self.next_ulid();
+            let msg = Message {
+                message_id,
+                mailbox_id: mailbox.agent_id.clone(),
+                sender_id: req.sender_id.clone(),
+                payload: req.payload.clone(),
+                headers: req.headers.clone(),
+                priority: req.priority,
+                created_at: now,
+                visible_at,
+                status: MessageStatus::Pending,
+                attempt_count: 0,
+                lease_expires_at: None,
+                claimed_by: None,
+                committed_at: None,
+                checkpoint_token: None,
+                expires_at,
+            };
+            state.messages.insert(message_id, msg.clone());
+        crate::metrics::record_send(&mailbox.agent_id);
+            messages.push(msg);
+            let _ = i;
+        }
+
+        Ok(messages)
+    }
+
+    async fn list_mailboxes(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<Vec<Mailbox>, PostboxError> {
+        let state = self.state.lock();
+        let out: Vec<Mailbox> = state
+            .mailboxes
+            .iter()
+            .filter(|(k, _)| after.map(|a| k.as_str() > a).unwrap_or(true))
+            .take(limit)
+            .map(|(_, v)| v.clone())
+            .collect();
+        Ok(out)
+    }
+
+    async fn mailbox_stats(
+        &self,
+        agent_id: &str,
+    ) -> Result<MailboxStats, PostboxError> {
+        validate_agent_id(agent_id)?;
+        let state = self.state.lock();
+        if !state.mailboxes.contains_key(agent_id) {
+            return Err(PostboxError::MailboxNotFound {
+                agent_id: agent_id.to_string(),
+            });
+        }
+
+        let mut pending_count: usize = 0;
+        let mut claimed_count: usize = 0;
+        let mut committed_count: usize = 0;
+        let mut oldest_pending_at: Option<SystemTime> = None;
+
+        for m in state.messages.values() {
+            if m.mailbox_id != agent_id {
+                continue;
+            }
+            match m.status {
+                MessageStatus::Pending => {
+                    pending_count += 1;
+                    oldest_pending_at = Some(match oldest_pending_at {
+                        Some(t) if t < m.created_at => t,
+                        _ => m.created_at,
+                    });
+                }
+                MessageStatus::Claimed => {
+                    claimed_count += 1;
+                }
+                MessageStatus::Committed => {
+                    committed_count += 1;
+                }
+                MessageStatus::DeadLettered => {}
+            }
+        }
+
+        let dead_lettered_count = state
+            .dead_letters
+            .values()
+            .filter(|d| d.mailbox_id == agent_id)
+            .count();
+
+        Ok(MailboxStats {
+            agent_id: agent_id.to_string(),
+            pending_count,
+            claimed_count,
+            committed_count,
+            dead_lettered_count,
+            oldest_pending_at,
+        })
+    }
+
+    async fn sweep_expired_messages(
+        &self,
+        now: SystemTime,
+    ) -> Result<usize, PostboxError> {
+        let mut state = self.state.lock();
+
+        // Collect message_ids of expired pending messages.
+        let expired_ids: Vec<Ulid> = state
+            .messages
+            .values()
+            .filter(|m| {
+                m.status == MessageStatus::Pending
+                    && m.expires_at.map(|e| e <= now).unwrap_or(false)
+            })
+            .map(|m| m.message_id)
+            .collect();
+
+        let count = expired_ids.len();
+        for mid in expired_ids {
+            let entry = state.messages.remove(&mid).unwrap();
+            let dead = DeadLetter {
+                message_id: entry.message_id,
+                mailbox_id: entry.mailbox_id,
+                sender_id: entry.sender_id,
+                payload: entry.payload,
+                headers: entry.headers,
+                priority: entry.priority,
+                created_at: entry.created_at,
+                attempt_count: entry.attempt_count,
+                failure_history: vec![],
+                poison_reason: PoisonReason::Expired,
+                dead_lettered_at: now,
+            };
+            state.dead_letters.insert(dead.message_id, dead);
+        }
+
+        Ok(count)
+    }
+
+    async fn purge_dead_letters(
+        &self,
+        mailbox_id: &str,
+        before: SystemTime,
+    ) -> Result<usize, PostboxError> {
+        validate_agent_id(mailbox_id)?;
+        let mut state = self.state.lock();
+
+        let to_remove: Vec<Ulid> = state
+            .dead_letters
+            .iter()
+            .filter(|(_, d)| d.mailbox_id == mailbox_id && d.dead_lettered_at < before)
+            .map(|(k, _)| *k)
+            .collect();
+
+        let count = to_remove.len();
+        for k in to_remove {
+            state.dead_letters.remove(&k);
+        }
+
+        Ok(count)
     }
 }
 

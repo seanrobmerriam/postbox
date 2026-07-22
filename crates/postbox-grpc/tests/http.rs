@@ -299,6 +299,237 @@ async fn replay_creates_new_message() {
     assert_eq!(body["headers"]["replayed_by"], "ops");
 }
 
+// --- Tests for the new features from FEATURE_PLAN.md --------------------
+
+#[tokio::test]
+async fn priority_ordering_is_set_and_returned() {
+    let (base, _h) = spawn_server(memory_state().await).await;
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{base}/v1/mailboxes/alice"))
+        .json(&serde_json::json!({"capacity": 100, "ordering_mode": "priority"}))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["ordering_mode"], "priority");
+
+    let res = client
+        .get(format!("{base}/v1/mailboxes/alice"))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["ordering_mode"], "priority");
+}
+
+#[tokio::test]
+async fn ttl_sets_expires_at_in_send_response() {
+    let (base, _h) = spawn_server(memory_state().await).await;
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{base}/v1/mailboxes/alice"))
+        .json(&serde_json::json!({"capacity": 10}))
+        .send()
+        .await
+        .unwrap();
+    let payload_b64 = base64::engine::general_purpose::STANDARD.encode(b"x");
+    let res = client
+        .post(format!("{base}/v1/mailboxes/alice/send"))
+        .json(&serde_json::json!({
+            "from": "bob",
+            "payload_base64": payload_b64,
+            "ttl_ms": 5_000,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(body["expires_at_ms"].is_i64());
+}
+
+#[tokio::test]
+async fn fanout_send_creates_messages_in_each_target() {
+    let (base, _h) = spawn_server(memory_state().await).await;
+    let client = reqwest::Client::new();
+    for a in ["alice", "bob", "carol"] {
+        client
+            .post(format!("{base}/v1/mailboxes/{a}"))
+            .json(&serde_json::json!({"capacity": 100}))
+            .send()
+            .await
+            .unwrap();
+    }
+    let payload_b64 = base64::engine::general_purpose::STANDARD.encode(b"broadcast");
+    let res = client
+        .post(format!("{base}/v1/fanout"))
+        .json(&serde_json::json!({
+            "targets": ["alice", "bob", "carol"],
+            "from": "ops",
+            "payload_base64": payload_b64,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let msgs = body["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3);
+    // Distinct message_ids across targets.
+    let ids: std::collections::HashSet<_> = msgs
+        .iter()
+        .map(|m| m["message_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 3);
+
+    // All three mailboxes should now show one pending message.
+    for a in ["alice", "bob", "carol"] {
+        let res = client
+            .get(format!("{base}/v1/mailboxes/{a}/peek?max=10"))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn list_mailboxes_returns_paginated_results() {
+    let (base, _h) = spawn_server(memory_state().await).await;
+    let client = reqwest::Client::new();
+    for a in ["alpha", "bravo", "charlie"] {
+        client
+            .post(format!("{base}/v1/mailboxes/{a}"))
+            .json(&serde_json::json!({"capacity": 1}))
+            .send()
+            .await
+            .unwrap();
+    }
+    let res = client
+        .get(format!("{base}/v1/mailboxes?limit=2"))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 2);
+    assert_eq!(body[0]["agent_id"], "alpha");
+    assert_eq!(body[1]["agent_id"], "bravo");
+
+    let res = client
+        .get(format!("{base}/v1/mailboxes?limit=10&after=bravo"))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["agent_id"], "charlie");
+}
+
+#[tokio::test]
+async fn mailbox_stats_returns_counters() {
+    let (base, _h) = spawn_server(memory_state().await).await;
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{base}/v1/mailboxes/q"))
+        .json(&serde_json::json!({"capacity": 10}))
+        .send()
+        .await
+        .unwrap();
+    let payload_b64 = base64::engine::general_purpose::STANDARD.encode(b"x");
+    for _ in 0..2 {
+        client
+            .post(format!("{base}/v1/mailboxes/q/send"))
+            .json(&serde_json::json!({"from": "a", "payload_base64": payload_b64}))
+            .send()
+            .await
+            .unwrap();
+    }
+    let res = client
+        .get(format!("{base}/v1/mailboxes/q/stats"))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["pending_count"], 2);
+    assert_eq!(body["claimed_count"], 0);
+    assert_eq!(body["committed_count"], 0);
+}
+
+#[tokio::test]
+async fn purge_dead_letters_returns_count() {
+    let (base, _h) = spawn_server(memory_state().await).await;
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{base}/v1/mailboxes/q"))
+        .json(&serde_json::json!({"capacity": 10}))
+        .send()
+        .await
+        .unwrap();
+    let payload_b64 = base64::engine::general_purpose::STANDARD.encode(b"x");
+    let res = client
+        .post(format!("{base}/v1/mailboxes/q/send"))
+        .json(&serde_json::json!({"from": "a", "payload_base64": payload_b64}))
+        .send()
+        .await
+        .unwrap();
+    let mid = res.json::<serde_json::Value>().await.unwrap()["message_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .post(format!("{base}/v1/mailboxes/q/claim"))
+        .json(&serde_json::json!({"claimer_id": "w"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/messages/{mid}/release"))
+        .json(&serde_json::json!({"claimer_id": "w", "kind": "permanent"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Purge with a future timestamp → deletes all DLQ rows.
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    let res = client
+        .delete(format!("{base}/v1/mailboxes/q/dead-letters"))
+        .json(&serde_json::json!({"before_ms": future}))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(body["deleted_count"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn metrics_endpoint_serves_text_format() {
+    // Initialise Prometheus before spawning any server so the recorder
+    // is the global one installed by `init_prometheus`.
+    let _ = postbox_grpc::init_prometheus();
+    let (base, _h) = spawn_server(memory_state().await).await;
+    let res = reqwest::get(format!("{base}/metrics")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ct = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ct.starts_with("text/plain"), "got content-type: {ct}");
+    let body = res.text().await.unwrap();
+    // Prometheus text format comments and HELP/TYPE lines start with '#'.
+    assert!(
+        body.contains('#') || body.is_empty(),
+        "expected Prometheus text format, got: {body}"
+    );
+}
+
 // Silence unused-import warnings in case a future edit doesn't use all helpers.
 #[allow(dead_code)]
 fn _silence_unused() {

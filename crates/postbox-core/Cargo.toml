@@ -24,6 +24,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 humantime-serde = { workspace = true }
+metrics = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

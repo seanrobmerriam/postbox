@@ -85,6 +85,7 @@ pub fn cfg(agent_id: &str, capacity: usize, max_attempts: u32) -> MailboxConfig 
         max_attempts,
         lease_duration: Duration::from_secs(60),
         max_payload_bytes: 1024,
+        dlq_retention: None,
     }
 }
 
@@ -101,6 +102,7 @@ pub fn cfg_with(
         max_attempts,
         lease_duration: Duration::from_secs(60),
         max_payload_bytes: max_payload,
+        dlq_retention: None,
     }
 }
 

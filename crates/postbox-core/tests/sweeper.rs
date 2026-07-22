@@ -28,6 +28,7 @@ async fn put_in_claimed_state(env: &TestEnv, ms: u64) {
             max_attempts: 100,
             lease_duration: Duration::from_secs(60),
             max_payload_bytes: 1024,
+                dlq_retention: None,
         })
         .await
         .unwrap();
@@ -107,6 +108,7 @@ async fn crash_recovery_reclaims_only_expired_leases_when_store_reconnects() {
         max_attempts: 100,
         lease_duration: Duration::from_secs(60),
         max_payload_bytes: 1024,
+                dlq_retention: None,
     })
     .await
     .unwrap();

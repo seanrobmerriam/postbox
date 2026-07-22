@@ -8,12 +8,14 @@
 //! `postbox-core`; no business logic is duplicated.
 
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::Stream;
 use postbox_core::{
-    validate_agent_id, FailureKind, MailboxStore, PoisonReason, SendRequest,
+    validate_agent_id, FailureKind, FanoutRequest, MailboxStore, PoisonReason, SendRequest,
 };
 use tonic::{transport::Server, Request, Response, Status};
 use ulid::Ulid;
@@ -28,19 +30,27 @@ use proto::{
     CommitRequest as GrpcCommitRequest, CommitResponse as GrpcCommitResponse,
     DeadLetter as GrpcDeadLetter, EnsureMailboxRequest as GrpcEnsureMailboxRequest,
     EnsureMailboxResponse as GrpcEnsureMailboxResponse,
+    FanoutSendRequest as GrpcFanoutSendRequest, FanoutSendResponse as GrpcFanoutSendResponse,
     GetMailboxRequest as GrpcGetMailboxRequest, GetMailboxResponse as GrpcGetMailboxResponse,
+    GetMailboxStatsRequest as GrpcGetMailboxStatsRequest,
+    GetMailboxStatsResponse as GrpcGetMailboxStatsResponse,
     Headers as GrpcHeaders, IsCommittedRequest as GrpcIsCommittedRequest,
     IsCommittedResponse as GrpcIsCommittedResponse,
     ListDeadLettersRequest as GrpcListDeadLettersRequest,
-    ListDeadLettersResponse as GrpcListDeadLettersResponse, Mailbox as GrpcMailbox,
-    Message as GrpcMessage,
+    ListDeadLettersResponse as GrpcListDeadLettersResponse,
+    ListMailboxesRequest as GrpcListMailboxesRequest,
+    ListMailboxesResponse as GrpcListMailboxesResponse, Mailbox as GrpcMailbox,
+    MailboxStats as GrpcMailboxStats, Message as GrpcMessage,
     PeekRequest as GrpcPeekRequest, PeekResponse as GrpcPeekResponse,
+    PurgeDeadLettersRequest as GrpcPurgeDeadLettersRequest,
+    PurgeDeadLettersResponse as GrpcPurgeDeadLettersResponse,
     RejectValidationRequest as GrpcRejectValidationRequest,
     RejectValidationResponse as GrpcRejectValidationResponse,
     ReleaseRequest as GrpcReleaseRequest, ReleaseResponse as GrpcReleaseResponse,
     ReplayDeadLetterRequest as GrpcReplayDeadLetterRequest,
     ReplayDeadLetterResponse as GrpcReplayDeadLetterResponse,
     SendMessageRequest as GrpcSendMessageRequest, SendMessageResponse as GrpcSendMessageResponse,
+    StreamClaimRequest as GrpcStreamClaimRequest,
 };
 
 /// gRPC adapter over a [`MailboxStore`].
@@ -102,6 +112,7 @@ fn message_to_grpc(m: postbox_core::Message) -> GrpcMessage {
         claimed_by: m.claimed_by.unwrap_or_default(),
         committed_at_ms: m.committed_at.map(st_to_ms).unwrap_or(0),
         checkpoint_token: m.checkpoint_token.unwrap_or_default(),
+        expires_at_ms: m.expires_at.map(st_to_ms).unwrap_or(0),
     }
 }
 
@@ -112,10 +123,12 @@ fn mailbox_to_grpc(m: postbox_core::Mailbox) -> GrpcMailbox {
         ordering_mode: match m.ordering_mode {
             postbox_core::OrderingMode::Fifo => "fifo".into(),
             postbox_core::OrderingMode::Unordered => "unordered".into(),
+            postbox_core::OrderingMode::Priority => "priority".into(),
         },
         max_attempts: m.max_attempts,
         lease_duration_ms: m.lease_duration.as_millis() as u64,
         max_payload_bytes: m.max_payload_bytes as u64,
+        dlq_retention_ms: m.dlq_retention.map(|d| d.as_millis() as u64).unwrap_or(0),
     }
 }
 
@@ -125,6 +138,9 @@ fn parse_ulid(s: &str) -> Result<Ulid, Status> {
 
 #[tonic::async_trait]
 impl PostboxService for PostboxGrpc {
+    type StreamClaimStream =
+        Pin<Box<dyn Stream<Item = Result<GrpcClaimResponse, Status>> + Send>>;
+
     async fn ensure_mailbox(
         &self,
         request: Request<GrpcEnsureMailboxRequest>,
@@ -133,7 +149,13 @@ impl PostboxService for PostboxGrpc {
         validate_agent_id(&req.agent_id).map_err(core_err_to_grpc)?;
         let ordering_mode = match req.ordering_mode.as_str() {
             "unordered" => postbox_core::OrderingMode::Unordered,
+            "priority" => postbox_core::OrderingMode::Priority,
             _ => postbox_core::OrderingMode::Fifo,
+        };
+        let dlq_retention = if req.dlq_retention_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(req.dlq_retention_ms))
         };
         let m = self
             .store
@@ -144,6 +166,7 @@ impl PostboxService for PostboxGrpc {
                 max_attempts: req.max_attempts,
                 lease_duration: Duration::from_millis(req.lease_duration_ms),
                 max_payload_bytes: req.max_payload_bytes as usize,
+                dlq_retention,
             })
             .await
             .map_err(core_err_to_grpc)?;
@@ -194,6 +217,11 @@ impl PostboxService for PostboxGrpc {
                     None
                 } else {
                     Some(Duration::from_millis(req.delay_ms))
+                },
+                ttl: if req.ttl_ms == 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(req.ttl_ms))
                 },
             })
             .await
@@ -319,6 +347,7 @@ impl PostboxService for PostboxGrpc {
             "max_attempts_exceeded" => Some(PoisonReason::MaxAttemptsExceeded),
             "permanent_failure" => Some(PoisonReason::PermanentFailure),
             "validation_failed" => Some(PoisonReason::ValidationFailed),
+            "expired" => Some(PoisonReason::Expired),
             other => {
                 return Err(Status::invalid_argument(format!("unknown reason: {other}")))
             }
@@ -347,6 +376,7 @@ impl PostboxService for PostboxGrpc {
                         PoisonReason::MaxAttemptsExceeded => "max_attempts_exceeded".into(),
                         PoisonReason::PermanentFailure => "permanent_failure".into(),
                         PoisonReason::ValidationFailed => "validation_failed".into(),
+                        PoisonReason::Expired => "expired".into(),
                     },
                     dead_lettered_at_ms: st_to_ms(d.dead_lettered_at),
                 })
@@ -374,6 +404,168 @@ impl PostboxService for PostboxGrpc {
         Ok(Response::new(GrpcReplayDeadLetterResponse {
             message: Some(message_to_grpc(m)),
         }))
+    }
+
+    async fn fanout(
+        &self,
+        request: Request<GrpcFanoutSendRequest>,
+    ) -> Result<Response<GrpcFanoutSendResponse>, Status> {
+        let req = request.into_inner();
+        for t in &req.targets {
+            validate_agent_id(t).map_err(core_err_to_grpc)?;
+        }
+        validate_agent_id(&req.from_agent).map_err(core_err_to_grpc)?;
+        let headers: BTreeMap<String, String> = req
+            .headers
+            .map(|h| h.entries.into_iter().collect())
+            .unwrap_or_default();
+        let messages = self
+            .store
+            .fanout_send(FanoutRequest {
+                targets: req.targets,
+                sender_id: req.from_agent,
+                payload: Bytes::from(req.payload),
+                headers,
+                priority: req.priority,
+                delay: if req.delay_ms == 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(req.delay_ms))
+                },
+                ttl: if req.ttl_ms == 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(req.ttl_ms))
+                },
+            })
+            .await
+            .map_err(core_err_to_grpc)?;
+        Ok(Response::new(GrpcFanoutSendResponse {
+            messages: messages.into_iter().map(message_to_grpc).collect(),
+        }))
+    }
+
+    async fn list_mailboxes(
+        &self,
+        request: Request<GrpcListMailboxesRequest>,
+    ) -> Result<Response<GrpcListMailboxesResponse>, Status> {
+        let req = request.into_inner();
+        let limit = if req.limit == 0 { 100 } else { req.limit as usize };
+        let after = if req.after.is_empty() {
+            None
+        } else {
+            Some(req.after.as_str())
+        };
+        let mailboxes = self
+            .store
+            .list_mailboxes(limit, after)
+            .await
+            .map_err(core_err_to_grpc)?;
+        Ok(Response::new(GrpcListMailboxesResponse {
+            mailboxes: mailboxes.into_iter().map(mailbox_to_grpc).collect(),
+        }))
+    }
+
+    async fn get_mailbox_stats(
+        &self,
+        request: Request<GrpcGetMailboxStatsRequest>,
+    ) -> Result<Response<GrpcGetMailboxStatsResponse>, Status> {
+        let req = request.into_inner();
+        validate_agent_id(&req.agent_id).map_err(core_err_to_grpc)?;
+        let stats = self
+            .store
+            .mailbox_stats(&req.agent_id)
+            .await
+            .map_err(core_err_to_grpc)?;
+        Ok(Response::new(GrpcGetMailboxStatsResponse {
+            stats: Some(GrpcMailboxStats {
+                agent_id: stats.agent_id,
+                pending_count: stats.pending_count as u64,
+                claimed_count: stats.claimed_count as u64,
+                committed_count: stats.committed_count as u64,
+                dead_lettered_count: stats.dead_lettered_count as u64,
+                oldest_pending_at_ms: stats
+                    .oldest_pending_at
+                    .map(st_to_ms)
+                    .unwrap_or(0),
+            }),
+        }))
+    }
+
+    async fn purge_dead_letters(
+        &self,
+        request: Request<GrpcPurgeDeadLettersRequest>,
+    ) -> Result<Response<GrpcPurgeDeadLettersResponse>, Status> {
+        let req = request.into_inner();
+        validate_agent_id(&req.agent_id).map_err(core_err_to_grpc)?;
+        let before = postbox_core::types::millis_to_system_time(req.before_ms);
+        let deleted = self
+            .store
+            .purge_dead_letters(&req.agent_id, before)
+            .await
+            .map_err(core_err_to_grpc)?;
+        Ok(Response::new(GrpcPurgeDeadLettersResponse {
+            deleted_count: deleted as u64,
+        }))
+    }
+
+    async fn stream_claim(
+        &self,
+        request: Request<GrpcStreamClaimRequest>,
+    ) -> Result<Response<Self::StreamClaimStream>, Status> {
+        let req = request.into_inner();
+        validate_agent_id(&req.agent_id).map_err(core_err_to_grpc)?;
+        validate_agent_id(&req.claimer_id).map_err(core_err_to_grpc)?;
+        let agent_id = req.agent_id;
+        let claimer_id = req.claimer_id;
+        let lease = if req.lease_duration_ms == 0 {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_millis(req.lease_duration_ms)
+        };
+        let poll_interval = if req.poll_interval_ms == 0 {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_millis(req.poll_interval_ms)
+        };
+        let max = req.max_messages;
+        let store = self.store.clone();
+
+        let stream = futures::stream::unfold(
+            (store, 0u32, false),
+            move |(store, count, done)| {
+                let agent_id = agent_id.clone();
+                let claimer_id = claimer_id.clone();
+                async move {
+                    if done || (max > 0 && count >= max) {
+                        return None;
+                    }
+                    loop {
+                        match store.claim(&agent_id, &claimer_id, lease).await {
+                            Ok(Some(c)) => {
+                                let resp = GrpcClaimResponse {
+                                    claim: Some(ClaimResponseMessage {
+                                        message: Some(message_to_grpc(c.message)),
+                                        lease_expires_at_ms: st_to_ms(c.lease_expires_at),
+                                    }),
+                                };
+                                return Some((Ok(resp), (store, count + 1, false)));
+                            }
+                            Ok(None) => {
+                                tokio::time::sleep(poll_interval).await;
+                            }
+                            Err(e) => {
+                                return Some((
+                                    Err(core_err_to_grpc(e)),
+                                    (store, count, true),
+                                ));
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        Ok(Response::new(Box::pin(stream)))
     }
 }
 

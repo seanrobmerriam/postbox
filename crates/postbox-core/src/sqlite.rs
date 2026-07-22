@@ -24,8 +24,8 @@ use crate::clock::Clock;
 use crate::error::PostboxError;
 use crate::store::MailboxStore;
 use crate::types::{
-    validate_agent_id, Claim, DeadLetter, FailureKind, FailureRecord, Mailbox, MailboxConfig,
-    Message, MessageStatus, OrderingMode, PoisonReason, SendRequest,
+    validate_agent_id, Claim, DeadLetter, FailureKind, FailureRecord, FanoutRequest, Mailbox,
+    MailboxConfig, MailboxStats, Message, MessageStatus, OrderingMode, PoisonReason, SendRequest,
 };
 
 /// SQLite-backed [`MailboxStore`].
@@ -122,7 +122,8 @@ impl SqliteStore {
               max_attempts       INTEGER NOT NULL,
               lease_duration_ms  INTEGER NOT NULL,
               max_payload_bytes  INTEGER NOT NULL,
-              created_at_ms      INTEGER NOT NULL
+              created_at_ms      INTEGER NOT NULL,
+              dlq_retention_ms   INTEGER DEFAULT NULL
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -140,6 +141,7 @@ impl SqliteStore {
               claimed_by        TEXT,
               committed_at_ms   INTEGER,
               checkpoint_token  TEXT,
+              expires_at_ms     INTEGER,
               FOREIGN KEY (mailbox_id) REFERENCES mailboxes(agent_id) ON DELETE CASCADE
             );
 
@@ -151,6 +153,9 @@ impl SqliteStore {
               WHERE status = 'claimed';
             CREATE INDEX IF NOT EXISTS idx_messages_sender_created
               ON messages(mailbox_id, sender_id, created_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_messages_expires
+              ON messages(mailbox_id, status, expires_at_ms)
+              WHERE status = 'pending' AND expires_at_ms IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS dead_letters (
               message_id         TEXT PRIMARY KEY,
@@ -180,6 +185,16 @@ impl SqliteStore {
         .execute(pool)
         .await
         .map_err(|e| PostboxError::Storage(format!("migrate: {e}")))?;
+
+        // Idempotent ALTER TABLE for existing databases that don't have the new columns.
+        // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we catch the error.
+        let _ = sqlx::query("ALTER TABLE messages ADD COLUMN expires_at_ms INTEGER")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE mailboxes ADD COLUMN dlq_retention_ms INTEGER DEFAULT NULL")
+            .execute(pool)
+            .await;
+
         Ok(())
     }
 
@@ -241,6 +256,9 @@ impl SqliteStore {
         let checkpoint_token: Option<String> = row
             .try_get("checkpoint_token")
             .map_err(|e| PostboxError::Storage(e.to_string()))?;
+        let expires_at_ms: Option<i64> = row
+            .try_get("expires_at_ms")
+            .map_err(|e| PostboxError::Storage(e.to_string()))?;
         Ok(Message {
             message_id,
             mailbox_id: row
@@ -262,6 +280,7 @@ impl SqliteStore {
             claimed_by,
             committed_at: committed_at_ms.map(Self::st),
             checkpoint_token,
+            expires_at: expires_at_ms.map(Self::st),
         })
     }
 }
@@ -277,13 +296,15 @@ impl MailboxStore for SqliteStore {
         let ordering = match config.ordering_mode {
             OrderingMode::Fifo => "fifo",
             OrderingMode::Unordered => "unordered",
+            OrderingMode::Priority => "priority",
         };
+        let dlq_retention_ms: Option<i64> = config.dlq_retention.map(|d| d.as_millis() as i64);
         sqlx::query(
             r#"
             INSERT INTO mailboxes
               (agent_id, capacity, ordering_mode, max_attempts,
-               lease_duration_ms, max_payload_bytes, created_at_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+               lease_duration_ms, max_payload_bytes, created_at_ms, dlq_retention_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(agent_id) DO NOTHING
             "#,
         )
@@ -294,6 +315,7 @@ impl MailboxStore for SqliteStore {
         .bind(lease_ms)
         .bind(config.max_payload_bytes as i64)
         .bind(now_ms)
+        .bind(dlq_retention_ms)
         .execute(&self.pool)
         .await
         .map_err(|e| PostboxError::Storage(format!("ensure_mailbox: {e}")))?;
@@ -317,6 +339,7 @@ impl MailboxStore for SqliteStore {
         {
             "fifo" => OrderingMode::Fifo,
             "unordered" => OrderingMode::Unordered,
+            "priority" => OrderingMode::Priority,
             other => {
                 return Err(PostboxError::Storage(format!(
                     "unknown ordering_mode {other}"
@@ -328,6 +351,9 @@ impl MailboxStore for SqliteStore {
             .map_err(|e| PostboxError::Storage(e.to_string()))?;
         let created_at_ms: i64 = row
             .try_get("created_at_ms")
+            .map_err(|e| PostboxError::Storage(e.to_string()))?;
+        let dlq_retention_ms: Option<i64> = row
+            .try_get("dlq_retention_ms")
             .map_err(|e| PostboxError::Storage(e.to_string()))?;
         Ok(Some(Mailbox {
             agent_id: row
@@ -344,6 +370,7 @@ impl MailboxStore for SqliteStore {
             max_payload_bytes: row
                 .try_get::<i64, _>("max_payload_bytes")
                 .map_err(|e| PostboxError::Storage(e.to_string()))? as usize,
+            dlq_retention: dlq_retention_ms.map(|ms| Duration::from_millis(ms.max(0) as u64)),
             created_at: Self::st(created_at_ms),
         }))
     }
@@ -382,8 +409,8 @@ impl MailboxStore for SqliteStore {
                     r#"
                     INSERT INTO mailboxes
                       (agent_id, capacity, ordering_mode, max_attempts,
-                       lease_duration_ms, max_payload_bytes, created_at_ms)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                       lease_duration_ms, max_payload_bytes, created_at_ms, dlq_retention_ms)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     "#,
                 )
                 .bind(&defaults.agent_id)
@@ -393,6 +420,7 @@ impl MailboxStore for SqliteStore {
                 .bind(lease_ms)
                 .bind(defaults.max_payload_bytes as i64)
                 .bind(now_ms)
+                .bind(None::<i64>)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| PostboxError::Storage(format!("auto-create: {e}")))?;
@@ -436,6 +464,9 @@ impl MailboxStore for SqliteStore {
             .delay
             .map(|d| now_ms.saturating_add(d.as_millis() as i64))
             .unwrap_or(now_ms);
+        let expires_at_ms: Option<i64> = req
+            .ttl
+            .map(|d| now_ms.saturating_add(d.as_millis() as i64));
         let message_id = self.next_ulid();
         let headers_json = serde_json::to_string(&req.headers)
             .map_err(|e| PostboxError::Storage(format!("headers: {e}")))?;
@@ -444,8 +475,8 @@ impl MailboxStore for SqliteStore {
             r#"
             INSERT INTO messages
               (message_id, mailbox_id, sender_id, payload, headers_json,
-               priority, created_at_ms, visible_at_ms, status, attempt_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0)
+               priority, created_at_ms, visible_at_ms, status, attempt_count, expires_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)
             "#,
         )
         .bind(message_id.to_string())
@@ -456,6 +487,7 @@ impl MailboxStore for SqliteStore {
         .bind(req.priority as i64)
         .bind(now_ms)
         .bind(visible_at_ms)
+        .bind(expires_at_ms)
         .execute(&mut *tx)
         .await
         .map_err(|e| PostboxError::Storage(format!("insert: {e}")))?;
@@ -463,6 +495,8 @@ impl MailboxStore for SqliteStore {
         tx.commit()
             .await
             .map_err(|e| PostboxError::Storage(format!("commit send: {e}")))?;
+
+        crate::metrics::record_send(&req.target_mailbox);
 
         Ok(Message {
             message_id,
@@ -479,6 +513,7 @@ impl MailboxStore for SqliteStore {
             claimed_by: None,
             committed_at: None,
             checkpoint_token: None,
+            expires_at: expires_at_ms.map(Self::st),
         })
     }
 
@@ -501,6 +536,7 @@ impl MailboxStore for SqliteStore {
                 .as_str()
             {
                 "fifo" => OrderingMode::Fifo,
+                "priority" => OrderingMode::Priority,
                 _ => OrderingMode::Unordered,
             },
             None => {
@@ -546,6 +582,13 @@ impl MailboxStore for SqliteStore {
                     a.message_id.cmp(&b.message_id),
                 )
             });
+        } else if matches!(ordering_mode, OrderingMode::Priority) {
+            messages.sort_by(|a, b| {
+                b.priority
+                    .cmp(&a.priority)
+                    .then(a.created_at.cmp(&b.created_at))
+                    .then(a.message_id.cmp(&b.message_id))
+            });
         }
         messages.truncate(max);
         Ok(messages)
@@ -588,6 +631,7 @@ impl MailboxStore for SqliteStore {
             .as_str()
         {
             "fifo" => OrderingMode::Fifo,
+            "priority" => OrderingMode::Priority,
             _ => OrderingMode::Unordered,
         };
 
@@ -650,6 +694,13 @@ impl MailboxStore for SqliteStore {
                     .copied()
                     .unwrap_or((m_or_default(b), b.message_id));
                 ka.cmp(&kb)
+                    .then(a.created_at.cmp(&b.created_at))
+                    .then(a.message_id.cmp(&b.message_id))
+            });
+        } else if matches!(ordering_mode, OrderingMode::Priority) {
+            messages.sort_by(|a, b| {
+                b.priority
+                    .cmp(&a.priority)
                     .then(a.created_at.cmp(&b.created_at))
                     .then(a.message_id.cmp(&b.message_id))
             });
@@ -735,6 +786,8 @@ impl MailboxStore for SqliteStore {
         tx.commit()
             .await
             .map_err(|e| PostboxError::Storage(format!("commit claim: {e}")))?;
+
+        crate::metrics::record_claim(mailbox_id);
 
         let mut claimed = target;
         claimed.status = MessageStatus::Claimed;
@@ -828,6 +881,7 @@ impl MailboxStore for SqliteStore {
         tx.commit()
             .await
             .map_err(|e| PostboxError::Storage(format!("commit tx: {e}")))?;
+        crate::metrics::record_commit(&mailbox_id);
         Ok(())
     }
 
@@ -855,6 +909,9 @@ impl MailboxStore for SqliteStore {
         .await
         .map_err(|e| PostboxError::Storage(format!("release lookup: {e}")))?;
         let row = row.ok_or(PostboxError::MessageNotFound(message_id))?;
+        let release_mailbox_id: String = row
+            .try_get("mailbox_id")
+            .map_err(|e| PostboxError::Storage(e.to_string()))?;
         let status: String = row
             .try_get("status")
             .map_err(|e| PostboxError::Storage(e.to_string()))?;
@@ -955,6 +1012,13 @@ impl MailboxStore for SqliteStore {
         tx.commit()
             .await
             .map_err(|e| PostboxError::Storage(format!("release commit: {e}")))?;
+        crate::metrics::record_release(
+            &release_mailbox_id,
+            match failure {
+                FailureKind::Transient => "transient",
+                FailureKind::Permanent => "permanent",
+            },
+        );
         Ok(())
     }
 
@@ -1065,6 +1129,7 @@ impl MailboxStore for SqliteStore {
                 PoisonReason::MaxAttemptsExceeded => "max_attempts_exceeded",
                 PoisonReason::PermanentFailure => "permanent_failure",
                 PoisonReason::ValidationFailed => "validation_failed",
+                PoisonReason::Expired => "expired",
             };
             sqlx::query(
                 "SELECT * FROM dead_letters
@@ -1120,6 +1185,7 @@ impl MailboxStore for SqliteStore {
                 "max_attempts_exceeded" => PoisonReason::MaxAttemptsExceeded,
                 "permanent_failure" => PoisonReason::PermanentFailure,
                 "validation_failed" => PoisonReason::ValidationFailed,
+                "expired" => PoisonReason::Expired,
                 other => return Err(PostboxError::Storage(format!("bad reason {other}"))),
             };
             out.push(DeadLetter {
@@ -1283,6 +1349,7 @@ impl MailboxStore for SqliteStore {
             claimed_by: None,
             committed_at: None,
             checkpoint_token: None,
+            expires_at: None,
         })
     }
 
@@ -1322,6 +1389,7 @@ impl MailboxStore for SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(|e| PostboxError::Storage(format!("sweep: {e}")))?;
+        crate::metrics::record_leases_swept(res.rows_affected());
         Ok(res.rows_affected() as usize)
     }
 
@@ -1339,6 +1407,399 @@ impl MailboxStore for SqliteStore {
             .try_get("c")
             .map_err(|e| PostboxError::Storage(e.to_string()))?;
         Ok(c as usize)
+    }
+
+    async fn fanout_send(
+        &self,
+        req: FanoutRequest,
+    ) -> Result<Vec<Message>, PostboxError> {
+        let _g = self.write_lock.lock().await;
+        validate_agent_id(&req.sender_id)?;
+        for target in &req.targets {
+            validate_agent_id(target)?;
+        }
+        crate::types::validate_headers(&req.headers)?;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| PostboxError::Storage(format!("begin fanout: {e}")))?;
+
+        let now = self.clock.now();
+        let now_ms = Self::ms(now);
+        let visible_at_ms = req
+            .delay
+            .map(|d| now_ms.saturating_add(d.as_millis() as i64))
+            .unwrap_or(now_ms);
+        let expires_at_ms: Option<i64> = req
+            .ttl
+            .map(|d| now_ms.saturating_add(d.as_millis() as i64));
+        let headers_json = serde_json::to_string(&req.headers)
+            .map_err(|e| PostboxError::Storage(format!("headers: {e}")))?;
+
+        let mut out = Vec::with_capacity(req.targets.len());
+
+        for target in &req.targets {
+            // Lookup or auto-create mailbox
+            let row = sqlx::query("SELECT * FROM mailboxes WHERE agent_id = ?")
+                .bind(target)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| PostboxError::Storage(format!("fanout lookup: {e}")))?;
+            let (capacity, max_payload_bytes): (i64, i64) = match row {
+                Some(r) => (
+                    r.try_get::<i64, _>("capacity")
+                        .map_err(|e| PostboxError::Storage(e.to_string()))?,
+                    r.try_get::<i64, _>("max_payload_bytes")
+                        .map_err(|e| PostboxError::Storage(e.to_string()))?,
+                ),
+                None => {
+                    let defaults = MailboxConfig::defaults_for(target.clone());
+                    let lease_ms = defaults.lease_duration.as_millis() as i64;
+                    sqlx::query(
+                        r#"
+                        INSERT INTO mailboxes
+                          (agent_id, capacity, ordering_mode, max_attempts,
+                           lease_duration_ms, max_payload_bytes, created_at_ms, dlq_retention_ms)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        "#,
+                    )
+                    .bind(&defaults.agent_id)
+                    .bind(defaults.capacity as i64)
+                    .bind("fifo")
+                    .bind(defaults.max_attempts as i64)
+                    .bind(lease_ms)
+                    .bind(defaults.max_payload_bytes as i64)
+                    .bind(now_ms)
+                    .bind(None::<i64>)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| PostboxError::Storage(format!("fanout auto-create: {e}")))?;
+                    (defaults.capacity as i64, defaults.max_payload_bytes as i64)
+                }
+            };
+
+            if req.payload.len() as i64 > max_payload_bytes {
+                return Err(PostboxError::PayloadTooLarge {
+                    size: req.payload.len(),
+                    max: max_payload_bytes as usize,
+                });
+            }
+
+            let active_row = sqlx::query(
+                "SELECT COUNT(*) AS c FROM messages
+                 WHERE mailbox_id = ? AND status IN ('pending','claimed')",
+            )
+            .bind(target)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| PostboxError::Storage(format!("fanout capacity: {e}")))?;
+            let active: i64 = active_row
+                .try_get("c")
+                .map_err(|e| PostboxError::Storage(e.to_string()))?;
+            if active >= capacity {
+                return Err(PostboxError::MailboxFull {
+                    agent_id: target.clone(),
+                    size: active as usize,
+                    capacity: capacity as usize,
+                });
+            }
+
+            let message_id = self.next_ulid();
+            sqlx::query(
+                r#"
+                INSERT INTO messages
+                  (message_id, mailbox_id, sender_id, payload, headers_json,
+                   priority, created_at_ms, visible_at_ms, status, attempt_count, expires_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)
+                "#,
+            )
+            .bind(message_id.to_string())
+            .bind(target)
+            .bind(&req.sender_id)
+            .bind(req.payload.as_ref())
+            .bind(&headers_json)
+            .bind(req.priority as i64)
+            .bind(now_ms)
+            .bind(visible_at_ms)
+            .bind(expires_at_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| PostboxError::Storage(format!("fanout insert: {e}")))?;
+
+            out.push(Message {
+                message_id,
+                mailbox_id: target.clone(),
+                sender_id: req.sender_id.clone(),
+                payload: req.payload.clone(),
+                headers: req.headers.clone(),
+                priority: req.priority,
+                created_at: Self::st(now_ms),
+                visible_at: Self::st(visible_at_ms),
+                status: MessageStatus::Pending,
+                attempt_count: 0,
+                lease_expires_at: None,
+                claimed_by: None,
+                committed_at: None,
+                checkpoint_token: None,
+                expires_at: expires_at_ms.map(Self::st),
+            });
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| PostboxError::Storage(format!("commit fanout: {e}")))?;
+        Ok(out)
+    }
+
+    async fn list_mailboxes(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<Vec<Mailbox>, PostboxError> {
+        let rows = match after {
+            Some(cursor) => {
+                sqlx::query("SELECT * FROM mailboxes WHERE agent_id > ? ORDER BY agent_id ASC LIMIT ?")
+                    .bind(cursor)
+                    .bind(limit as i64)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| PostboxError::Storage(format!("list_mailboxes: {e}")))?
+            }
+            None => {
+                sqlx::query("SELECT * FROM mailboxes ORDER BY agent_id ASC LIMIT ?")
+                    .bind(limit as i64)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| PostboxError::Storage(format!("list_mailboxes: {e}")))?
+            }
+        };
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let ordering_mode = match row
+                .try_get::<String, _>("ordering_mode")
+                .map_err(|e| PostboxError::Storage(e.to_string()))?
+                .as_str()
+            {
+                "fifo" => OrderingMode::Fifo,
+                "unordered" => OrderingMode::Unordered,
+                "priority" => OrderingMode::Priority,
+                other => {
+                    return Err(PostboxError::Storage(format!(
+                        "unknown ordering_mode {other}"
+                    )))
+                }
+            };
+            let lease_ms: i64 = row
+                .try_get("lease_duration_ms")
+                .map_err(|e| PostboxError::Storage(e.to_string()))?;
+            let created_at_ms: i64 = row
+                .try_get("created_at_ms")
+                .map_err(|e| PostboxError::Storage(e.to_string()))?;
+            let dlq_retention_ms: Option<i64> = row
+                .try_get("dlq_retention_ms")
+                .map_err(|e| PostboxError::Storage(e.to_string()))?;
+            out.push(Mailbox {
+                agent_id: row
+                    .try_get::<String, _>("agent_id")
+                    .map_err(|e| PostboxError::Storage(e.to_string()))?,
+                capacity: row
+                    .try_get::<i64, _>("capacity")
+                    .map_err(|e| PostboxError::Storage(e.to_string()))? as usize,
+                ordering_mode,
+                max_attempts: row
+                    .try_get::<i64, _>("max_attempts")
+                    .map_err(|e| PostboxError::Storage(e.to_string()))? as u32,
+                lease_duration: Duration::from_millis(lease_ms.max(0) as u64),
+                max_payload_bytes: row
+                    .try_get::<i64, _>("max_payload_bytes")
+                    .map_err(|e| PostboxError::Storage(e.to_string()))? as usize,
+                dlq_retention: dlq_retention_ms.map(|ms| Duration::from_millis(ms.max(0) as u64)),
+                created_at: Self::st(created_at_ms),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn mailbox_stats(
+        &self,
+        agent_id: &str,
+    ) -> Result<MailboxStats, PostboxError> {
+        validate_agent_id(agent_id)?;
+
+        // Check mailbox exists
+        let exists = sqlx::query("SELECT 1 FROM mailboxes WHERE agent_id = ?")
+            .bind(agent_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| PostboxError::Storage(format!("stats exists: {e}")))?;
+        if exists.is_none() {
+            return Err(PostboxError::MailboxNotFound {
+                agent_id: agent_id.to_string(),
+            });
+        }
+
+        let pending_row = sqlx::query(
+            "SELECT COUNT(*) AS c FROM messages WHERE mailbox_id = ? AND status = 'pending'",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| PostboxError::Storage(format!("stats pending: {e}")))?;
+        let pending_count: i64 = pending_row
+            .try_get("c")
+            .map_err(|e| PostboxError::Storage(e.to_string()))?;
+
+        let claimed_row = sqlx::query(
+            "SELECT COUNT(*) AS c FROM messages WHERE mailbox_id = ? AND status = 'claimed'",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| PostboxError::Storage(format!("stats claimed: {e}")))?;
+        let claimed_count: i64 = claimed_row
+            .try_get("c")
+            .map_err(|e| PostboxError::Storage(e.to_string()))?;
+
+        let committed_row = sqlx::query(
+            "SELECT COUNT(*) AS c FROM messages WHERE mailbox_id = ? AND status = 'committed'",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| PostboxError::Storage(format!("stats committed: {e}")))?;
+        let committed_count: i64 = committed_row
+            .try_get("c")
+            .map_err(|e| PostboxError::Storage(e.to_string()))?;
+
+        let dlq_row = sqlx::query(
+            "SELECT COUNT(*) AS c FROM dead_letters WHERE mailbox_id = ?",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| PostboxError::Storage(format!("stats dlq: {e}")))?;
+        let dead_lettered_count: i64 = dlq_row
+            .try_get("c")
+            .map_err(|e| PostboxError::Storage(e.to_string()))?;
+
+        let oldest_row = sqlx::query(
+            "SELECT MIN(created_at_ms) AS oldest FROM messages
+             WHERE mailbox_id = ? AND status = 'pending'",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| PostboxError::Storage(format!("stats oldest: {e}")))?;
+        let oldest_pending_ms: Option<i64> = oldest_row
+            .try_get("oldest")
+            .map_err(|e| PostboxError::Storage(e.to_string()))?;
+
+        Ok(MailboxStats {
+            agent_id: agent_id.to_string(),
+            pending_count: pending_count as usize,
+            claimed_count: claimed_count as usize,
+            committed_count: committed_count as usize,
+            dead_lettered_count: dead_lettered_count as usize,
+            oldest_pending_at: oldest_pending_ms.map(Self::st),
+        })
+    }
+
+    async fn sweep_expired_messages(
+        &self,
+        now: SystemTime,
+    ) -> Result<usize, PostboxError> {
+        let _g = self.write_lock.lock().await;
+        let now_ms = Self::ms(now);
+
+        let rows = sqlx::query(
+            "SELECT * FROM messages
+             WHERE status = 'pending' AND expires_at_ms IS NOT NULL AND expires_at_ms <= ?",
+        )
+        .bind(now_ms)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| PostboxError::Storage(format!("sweep expired fetch: {e}")))?;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| PostboxError::Storage(format!("begin sweep expired: {e}")))?;
+
+        let mut count: usize = 0;
+        for row in &rows {
+            let m = Self::row_to_message(row)?;
+            let failure_history = vec![FailureRecord {
+                attempt: m.attempt_count,
+                claimed_by: None,
+                failure_kind: FailureKind::Permanent,
+                note: Some("message TTL expired before being claimed".to_string()),
+                at: now,
+            }];
+            let headers_json = serde_json::to_string(&m.headers)
+                .map_err(|e| PostboxError::Storage(e.to_string()))?;
+
+            sqlx::query(
+                "INSERT OR REPLACE INTO dead_letters
+                  (message_id, mailbox_id, sender_id, payload, headers_json,
+                   priority, created_at_ms, attempt_count,
+                   failure_history_json, poison_reason, dead_lettered_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(m.message_id.to_string())
+            .bind(&m.mailbox_id)
+            .bind(&m.sender_id)
+            .bind(m.payload.as_ref())
+            .bind(headers_json)
+            .bind(m.priority as i64)
+            .bind(Self::ms(m.created_at))
+            .bind(m.attempt_count as i64)
+            .bind(serde_json::to_string(&failure_history)
+                .map_err(|e| PostboxError::Storage(e.to_string()))?)
+            .bind("expired")
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| PostboxError::Storage(format!("sweep expired dlq insert: {e}")))?;
+
+            sqlx::query("DELETE FROM messages WHERE message_id = ?")
+                .bind(m.message_id.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| PostboxError::Storage(format!("sweep expired delete: {e}")))?;
+
+            count += 1;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| PostboxError::Storage(format!("commit sweep expired: {e}")))?;
+        Ok(count)
+    }
+
+    async fn purge_dead_letters(
+        &self,
+        mailbox_id: &str,
+        before: SystemTime,
+    ) -> Result<usize, PostboxError> {
+        validate_agent_id(mailbox_id)?;
+        let before_ms = Self::ms(before);
+        let res = sqlx::query(
+            "DELETE FROM dead_letters WHERE mailbox_id = ? AND dead_lettered_at_ms < ?",
+        )
+        .bind(mailbox_id)
+        .bind(before_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| PostboxError::Storage(format!("purge_dead_letters: {e}")))?;
+        Ok(res.rows_affected() as usize)
     }
 }
 

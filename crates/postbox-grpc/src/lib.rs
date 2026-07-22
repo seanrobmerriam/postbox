@@ -3,4 +3,4 @@
 pub mod grpc;
 pub mod http;
 
-pub use http::{router, AppState, HttpError, HttpResult};
+pub use http::{router, AppState, HttpError, HttpResult, init_prometheus};

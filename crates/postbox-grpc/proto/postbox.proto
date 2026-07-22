@@ -14,15 +14,21 @@ service PostboxService {
   rpc IsCommitted(IsCommittedRequest) returns (IsCommittedResponse);
   rpc ListDeadLetters(ListDeadLettersRequest) returns (ListDeadLettersResponse);
   rpc ReplayDeadLetter(ReplayDeadLetterRequest) returns (ReplayDeadLetterResponse);
+  rpc Fanout(FanoutSendRequest) returns (FanoutSendResponse);
+  rpc ListMailboxes(ListMailboxesRequest) returns (ListMailboxesResponse);
+  rpc GetMailboxStats(GetMailboxStatsRequest) returns (GetMailboxStatsResponse);
+  rpc PurgeDeadLetters(PurgeDeadLettersRequest) returns (PurgeDeadLettersResponse);
+  rpc StreamClaim(StreamClaimRequest) returns (stream ClaimResponse);
 }
 
 message Mailbox {
   string agent_id = 1;
   uint64 capacity = 2;
-  string ordering_mode = 3;   // "fifo" | "unordered"
+  string ordering_mode = 3;   // "fifo" | "unordered" | "priority"
   uint32 max_attempts = 4;
   uint64 lease_duration_ms = 5;
   uint64 max_payload_bytes = 6;
+  uint64 dlq_retention_ms = 7;  // 0 means none
 }
 
 message Headers {
@@ -45,6 +51,7 @@ message Message {
   string claimed_by = 12;
   int64 committed_at_ms = 13;
   string checkpoint_token = 14;
+  int64 expires_at_ms = 15;  // 0 means no TTL
 }
 
 message ClaimResponseMessage {
@@ -55,10 +62,11 @@ message ClaimResponseMessage {
 message EnsureMailboxRequest {
   string agent_id = 1;
   uint64 capacity = 2;
-  string ordering_mode = 3;
+  string ordering_mode = 3;  // "fifo" | "unordered" | "priority"
   uint32 max_attempts = 4;
   uint64 lease_duration_ms = 5;
   uint64 max_payload_bytes = 6;
+  uint64 dlq_retention_ms = 7;  // 0 means none
 }
 message EnsureMailboxResponse { Mailbox mailbox = 1; }
 
@@ -72,6 +80,7 @@ message SendMessageRequest {
   Headers headers = 4;
   int32 priority = 5;
   uint64 delay_ms = 6;
+  uint64 ttl_ms = 7;  // 0 means no TTL
 }
 message SendMessageResponse { Message message = 1; }
 
@@ -134,3 +143,49 @@ message ReplayDeadLetterRequest {
   string replayed_by = 3;
 }
 message ReplayDeadLetterResponse { Message message = 1; }
+
+// Feature 3: Fanout
+message FanoutSendRequest {
+  repeated string targets = 1;
+  string from_agent = 2;
+  bytes payload = 3;
+  Headers headers = 4;
+  int32 priority = 5;
+  uint64 delay_ms = 6;
+  uint64 ttl_ms = 7;
+}
+message FanoutSendResponse { repeated Message messages = 1; }
+
+// Feature 4: Admin/inspection
+message ListMailboxesRequest {
+  uint32 limit = 1;
+  string after = 2;  // cursor: agent_id
+}
+message ListMailboxesResponse { repeated Mailbox mailboxes = 1; }
+
+message GetMailboxStatsRequest { string agent_id = 1; }
+message MailboxStats {
+  string agent_id = 1;
+  uint64 pending_count = 2;
+  uint64 claimed_count = 3;
+  uint64 committed_count = 4;
+  uint64 dead_lettered_count = 5;
+  int64 oldest_pending_at_ms = 6;  // 0 if none
+}
+message GetMailboxStatsResponse { MailboxStats stats = 1; }
+
+// Feature 6: DLQ purge
+message PurgeDeadLettersRequest {
+  string agent_id = 1;
+  int64 before_ms = 2;
+}
+message PurgeDeadLettersResponse { uint64 deleted_count = 1; }
+
+// Feature 7: Streaming claim
+message StreamClaimRequest {
+  string agent_id = 1;
+  string claimer_id = 2;
+  uint64 lease_duration_ms = 3;
+  uint64 poll_interval_ms = 4;  // how often to poll when empty
+  uint32 max_messages = 5;      // 0 = unlimited
+}

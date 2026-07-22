@@ -22,10 +22,14 @@
 //! POST   /v1/mailboxes/{agent_id}/claim        — claim
 //! GET    /v1/mailboxes/{agent_id}/committed/{message_id} — is_committed
 //! GET    /v1/mailboxes/{agent_id}/dead-letters — list DLQ
+//! DELETE /v1/mailboxes/{agent_id}/dead-letters — purge DLQ
 //! POST   /v1/dead-letters/{message_id}/replay  — replay
 //! POST   /v1/messages/{message_id}/commit      — commit (with checkpoint token)
 //! POST   /v1/messages/{message_id}/release     — release (transient|permanent)
 //! POST   /v1/messages/{message_id}/reject-validation — pre-claim reject
+//! POST   /v1/fanout                             — fanout send
+//! GET    /v1/mailboxes                          — list mailboxes
+//! GET    /v1/mailboxes/{agent_id}/stats         — mailbox stats
 //! ```
 //!
 //! Errors map to HTTP statuses:
@@ -42,7 +46,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -51,7 +55,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use postbox_core::{
-    validate_agent_id, FailureKind, MailboxConfig, MailboxStore, PoisonReason, SendRequest,
+    validate_agent_id, FailureKind, FanoutRequest, MailboxConfig, MailboxStore, PoisonReason,
+    SendRequest,
 };
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -124,6 +129,10 @@ impl AppState {
 /// address with a hyper server (or `axum::serve`).
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route(
+            "/v1/mailboxes",
+            get(list_mailboxes_handler),
+        )
         .route("/v1/mailboxes/:agent_id", post(ensure_mailbox).get(get_mailbox))
         .route("/v1/mailboxes/:agent_id/send", post(send_message))
         .route("/v1/mailboxes/:agent_id/peek", get(peek_messages))
@@ -134,7 +143,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/v1/mailboxes/:agent_id/dead-letters",
-            get(list_dead_letters),
+            get(list_dead_letters).delete(purge_dead_letters_handler),
+        )
+        .route(
+            "/v1/mailboxes/:agent_id/stats",
+            get(mailbox_stats_handler),
         )
         .route("/v1/dead-letters/:message_id/replay", post(replay_dead_letter))
         .route("/v1/messages/:message_id/commit", post(commit_message))
@@ -143,12 +156,45 @@ pub fn router(state: AppState) -> Router {
             "/v1/messages/:message_id/reject-validation",
             post(reject_validation),
         )
+        .route("/v1/fanout", post(fanout_send))
         .route("/healthz", get(health))
+        .route("/metrics", get(prometheus_metrics))
         .with_state(state)
 }
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Renders Prometheus text-format metrics. The global recorder must have
+/// been installed via [`init_prometheus`] before this handler is called.
+async fn prometheus_metrics() -> impl IntoResponse {
+    use std::sync::OnceLock;
+    static HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+    let handle = HANDLE.get_or_init(init_prometheus);
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        handle.render(),
+    )
+}
+
+/// Install the Prometheus metrics recorder as the global default.
+///
+/// The recorder is process-global and can only be set once. Repeated
+/// calls install nothing new and return the original handle, so this is
+/// safe to call from multiple test bodies / startup paths.
+pub fn init_prometheus() -> metrics_exporter_prometheus::PrometheusHandle {
+    use std::sync::OnceLock;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    static HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            PrometheusBuilder::new()
+                .install_recorder()
+                .expect("install prometheus recorder")
+        })
+        .clone()
 }
 
 // --- Request / response shapes ----------------------------------------------
@@ -160,6 +206,7 @@ pub struct EnsureMailboxRequest {
     pub max_attempts: Option<u32>,
     pub lease_duration_ms: Option<u64>,
     pub max_payload_bytes: Option<usize>,
+    pub dlq_retention_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -170,6 +217,7 @@ pub struct MailboxDto {
     pub max_attempts: u32,
     pub lease_duration_ms: u64,
     pub max_payload_bytes: usize,
+    pub dlq_retention_ms: Option<u64>,
 }
 
 impl From<postbox_core::Mailbox> for MailboxDto {
@@ -180,10 +228,12 @@ impl From<postbox_core::Mailbox> for MailboxDto {
             ordering_mode: match m.ordering_mode {
                 postbox_core::OrderingMode::Fifo => "fifo".into(),
                 postbox_core::OrderingMode::Unordered => "unordered".into(),
+                postbox_core::OrderingMode::Priority => "priority".into(),
             },
             max_attempts: m.max_attempts,
             lease_duration_ms: m.lease_duration.as_millis() as u64,
             max_payload_bytes: m.max_payload_bytes,
+            dlq_retention_ms: m.dlq_retention.map(|d| d.as_millis() as u64),
         }
     }
 }
@@ -197,6 +247,7 @@ pub struct SendRequestDto {
     pub headers: BTreeMap<String, String>,
     pub priority: Option<i32>,
     pub delay_ms: Option<u64>,
+    pub ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,6 +267,7 @@ pub struct MessageDto {
     pub claimed_by: Option<String>,
     pub committed_at_ms: Option<i64>,
     pub checkpoint_token: Option<String>,
+    pub expires_at_ms: Option<i64>,
 }
 
 impl From<postbox_core::Message> for MessageDto {
@@ -246,6 +298,9 @@ impl From<postbox_core::Message> for MessageDto {
                 .committed_at
                 .map(postbox_core::types::system_time_to_millis),
             checkpoint_token: m.checkpoint_token,
+            expires_at_ms: m
+                .expires_at
+                .map(postbox_core::types::system_time_to_millis),
         }
     }
 }
@@ -346,6 +401,7 @@ impl From<postbox_core::DeadLetter> for DeadLetterDto {
                 postbox_core::PoisonReason::MaxAttemptsExceeded => "max_attempts_exceeded",
                 postbox_core::PoisonReason::PermanentFailure => "permanent_failure",
                 postbox_core::PoisonReason::ValidationFailed => "validation_failed",
+                postbox_core::PoisonReason::Expired => "expired",
             }
             .to_string(),
             dead_lettered_at_ms: postbox_core::types::system_time_to_millis(d.dead_lettered_at),
@@ -368,6 +424,54 @@ impl From<postbox_core::DeadLetter> for DeadLetterDto {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct FanoutRequestDto {
+    pub targets: Vec<String>,
+    pub from: String,
+    pub payload_base64: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    pub priority: Option<i32>,
+    pub delay_ms: Option<u64>,
+    pub ttl_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListMailboxesQuery {
+    pub limit: Option<usize>,
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MailboxStatsDto {
+    pub agent_id: String,
+    pub pending_count: usize,
+    pub claimed_count: usize,
+    pub committed_count: usize,
+    pub dead_lettered_count: usize,
+    pub oldest_pending_at_ms: Option<i64>,
+}
+
+impl From<postbox_core::MailboxStats> for MailboxStatsDto {
+    fn from(s: postbox_core::MailboxStats) -> Self {
+        Self {
+            agent_id: s.agent_id,
+            pending_count: s.pending_count,
+            claimed_count: s.claimed_count,
+            committed_count: s.committed_count,
+            dead_lettered_count: s.dead_lettered_count,
+            oldest_pending_at_ms: s
+                .oldest_pending_at
+                .map(postbox_core::types::system_time_to_millis),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PurgeRequest {
+    pub before_ms: i64,
+}
+
 // --- Handlers ---------------------------------------------------------------
 
 async fn ensure_mailbox(
@@ -385,11 +489,13 @@ async fn ensure_mailbox(
             .unwrap_or("fifo")
         {
             "unordered" => postbox_core::OrderingMode::Unordered,
+            "priority" => postbox_core::OrderingMode::Priority,
             _ => postbox_core::OrderingMode::Fifo,
         },
         max_attempts: req.max_attempts.unwrap_or(5),
         lease_duration: Duration::from_millis(req.lease_duration_ms.unwrap_or(60_000)),
         max_payload_bytes: req.max_payload_bytes.unwrap_or(1024 * 1024),
+        dlq_retention: req.dlq_retention_ms.map(Duration::from_millis),
     };
     let m = state.store.ensure_mailbox(cfg).await?;
     Ok(Json(m.into()))
@@ -429,6 +535,7 @@ async fn send_message(
         headers: req.headers,
         priority: req.priority.unwrap_or(0),
         delay: req.delay_ms.map(Duration::from_millis),
+        ttl: req.ttl_ms.map(Duration::from_millis),
     };
     let m = state.store.send(send_req).await?;
     Ok((StatusCode::CREATED, Json(m.into())))
@@ -521,6 +628,7 @@ async fn list_dead_letters(
         Some("max_attempts_exceeded") => Some(PoisonReason::MaxAttemptsExceeded),
         Some("permanent_failure") => Some(PoisonReason::PermanentFailure),
         Some("validation_failed") => Some(PoisonReason::ValidationFailed),
+        Some("expired") => Some(PoisonReason::Expired),
         Some(other) => return Err(HttpError::BadRequest(format!("unknown reason: {other}"))),
     };
     let limit = q.limit.unwrap_or(100);
@@ -543,6 +651,64 @@ async fn replay_dead_letter(
         .replay_dead_letter(mid, req.target_mailbox.as_deref(), &req.replayed_by)
         .await?;
     Ok((StatusCode::CREATED, Json(m.into())))
+}
+
+async fn fanout_send(
+    State(state): State<AppState>,
+    Json(req): Json<FanoutRequestDto>,
+) -> HttpResult<(StatusCode, Json<serde_json::Value>)> {
+    use base64::Engine;
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(&req.payload_base64)
+        .map_err(|e| HttpError::BadRequest(format!("invalid base64 payload: {e}")))?;
+    for target in &req.targets {
+        validate_agent_id(target)?;
+    }
+    validate_agent_id(&req.from)?;
+    let fanout_req = FanoutRequest {
+        targets: req.targets,
+        sender_id: req.from,
+        payload: Bytes::from(payload),
+        headers: req.headers,
+        priority: req.priority.unwrap_or(0),
+        delay: req.delay_ms.map(Duration::from_millis),
+        ttl: req.ttl_ms.map(Duration::from_millis),
+    };
+    let messages = state.store.fanout_send(fanout_req).await?;
+    let dtos: Vec<MessageDto> = messages.into_iter().map(Into::into).collect();
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "messages": dtos })),
+    ))
+}
+
+async fn list_mailboxes_handler(
+    State(state): State<AppState>,
+    Query(q): Query<ListMailboxesQuery>,
+) -> HttpResult<Json<Vec<MailboxDto>>> {
+    let limit = q.limit.unwrap_or(100);
+    let mailboxes = state.store.list_mailboxes(limit, q.after.as_deref()).await?;
+    Ok(Json(mailboxes.into_iter().map(Into::into).collect()))
+}
+
+async fn mailbox_stats_handler(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> HttpResult<Json<MailboxStatsDto>> {
+    validate_agent_id(&agent_id)?;
+    let stats = state.store.mailbox_stats(&agent_id).await?;
+    Ok(Json(stats.into()))
+}
+
+async fn purge_dead_letters_handler(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(req): Json<PurgeRequest>,
+) -> HttpResult<Json<serde_json::Value>> {
+    validate_agent_id(&agent_id)?;
+    let before = UNIX_EPOCH + Duration::from_millis(req.before_ms as u64);
+    let deleted_count = state.store.purge_dead_letters(&agent_id, before).await?;
+    Ok(Json(serde_json::json!({ "deleted_count": deleted_count })))
 }
 
 fn parse_ulid(s: &str) -> HttpResult<Ulid> {

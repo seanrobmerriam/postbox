@@ -12,6 +12,7 @@ pub mod clock;
 pub mod error;
 pub mod store;
 pub mod types;
+pub mod metrics;
 
 pub mod memory;
 pub mod sqlite;
@@ -23,8 +24,9 @@ pub use memory::MemoryStore;
 pub use store::MailboxStore;
 pub use sqlite::SqliteStore;
 pub use types::{
-    validate_agent_id, validate_headers, Claim, DeadLetter, FailureKind, FailureRecord, Mailbox,
-    MailboxConfig, Message, MessageStatus, OrderingMode, PoisonReason, SendRequest,
+    validate_agent_id, validate_headers, Claim, DeadLetter, FailureKind, FailureRecord,
+    FanoutRequest, Mailbox, MailboxConfig, MailboxStats, Message, MessageStatus, OrderingMode,
+    PoisonReason, SendRequest,
 };
 
 #[cfg(test)]

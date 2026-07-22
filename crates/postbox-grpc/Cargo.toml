@@ -32,6 +32,8 @@ chrono = { workspace = true }
 ulid = { workspace = true }
 bytes = { workspace = true }
 base64 = "0.22"
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

@@ -21,6 +21,9 @@ use ulid::Ulid;
 pub enum OrderingMode {
     Fifo,
     Unordered,
+    /// Pick the highest-priority visible message first. Equal-priority
+    /// messages are delivered FIFO within that priority band.
+    Priority,
 }
 
 impl Default for OrderingMode {
@@ -68,6 +71,8 @@ pub enum PoisonReason {
     /// Rejected before reaching any consumer via
     /// [`crate::MailboxStore::reject_validation`].
     ValidationFailed,
+    /// Message TTL expired before it was claimed.
+    Expired,
 }
 
 /// Configuration for creating or updating a mailbox.
@@ -79,6 +84,9 @@ pub struct MailboxConfig {
     pub max_attempts: u32,
     pub lease_duration: Duration,
     pub max_payload_bytes: usize,
+    /// Optional DLQ retention window. Dead letters older than this are
+    /// pruned by the sweeper. `None` means dead letters are kept forever.
+    pub dlq_retention: Option<Duration>,
 }
 
 impl MailboxConfig {
@@ -91,6 +99,7 @@ impl MailboxConfig {
             max_attempts: 5,
             lease_duration: Duration::from_secs(60),
             max_payload_bytes: 1024 * 1024, // 1 MiB
+            dlq_retention: None,
         }
     }
 }
@@ -104,7 +113,31 @@ pub struct Mailbox {
     pub max_attempts: u32,
     pub lease_duration: Duration,
     pub max_payload_bytes: usize,
+    pub dlq_retention: Option<Duration>,
     pub created_at: SystemTime,
+}
+
+/// Aggregate statistics for a single mailbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailboxStats {
+    pub agent_id: String,
+    pub pending_count: usize,
+    pub claimed_count: usize,
+    pub committed_count: usize,
+    pub dead_lettered_count: usize,
+    pub oldest_pending_at: Option<SystemTime>,
+}
+
+/// Request to send one message to multiple mailboxes atomically.
+#[derive(Debug, Clone)]
+pub struct FanoutRequest {
+    pub targets: Vec<String>,
+    pub sender_id: String,
+    pub payload: Bytes,
+    pub headers: BTreeMap<String, String>,
+    pub priority: i32,
+    pub delay: Option<Duration>,
+    pub ttl: Option<Duration>,
 }
 
 /// One entry in a dead-letter failure history.
@@ -250,6 +283,9 @@ pub struct Message {
     pub claimed_by: Option<String>,
     pub committed_at: Option<SystemTime>,
     pub checkpoint_token: Option<String>,
+    /// Absolute deadline: if the message is still `pending` past this time,
+    /// the sweeper dead-letters it with reason `Expired`. `None` = no TTL.
+    pub expires_at: Option<SystemTime>,
 }
 
 impl Serialize for Message {
@@ -258,7 +294,7 @@ impl Serialize for Message {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("Message", 13)?;
+        let mut st = s.serialize_struct("Message", 14)?;
         st.serialize_field("message_id", &self.message_id)?;
         st.serialize_field("mailbox_id", &self.mailbox_id)?;
         st.serialize_field("sender_id", &self.sender_id)?;
@@ -273,6 +309,7 @@ impl Serialize for Message {
         st.serialize_field("claimed_by", &self.claimed_by)?;
         st.serialize_field("committed_at", &self.committed_at)?;
         st.serialize_field("checkpoint_token", &self.checkpoint_token)?;
+        st.serialize_field("expires_at", &self.expires_at)?;
         st.end()
     }
 }
@@ -304,6 +341,7 @@ impl<'de> Deserialize<'de> for Message {
                 let mut claimed_by: Option<Option<String>> = None;
                 let mut committed_at: Option<Option<SystemTime>> = None;
                 let mut checkpoint_token: Option<Option<String>> = None;
+                let mut expires_at: Option<Option<SystemTime>> = None;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "message_id" => message_id = Some(map.next_value()?),
@@ -320,6 +358,7 @@ impl<'de> Deserialize<'de> for Message {
                         "claimed_by" => claimed_by = Some(map.next_value()?),
                         "committed_at" => committed_at = Some(map.next_value()?),
                         "checkpoint_token" => checkpoint_token = Some(map.next_value()?),
+                        "expires_at" => expires_at = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -354,6 +393,8 @@ impl<'de> Deserialize<'de> for Message {
                         .ok_or_else(|| de::Error::missing_field("committed_at"))?,
                     checkpoint_token: checkpoint_token
                         .ok_or_else(|| de::Error::missing_field("checkpoint_token"))?,
+                    expires_at: expires_at
+                        .unwrap_or(None),
                 })
             }
         }
@@ -395,6 +436,10 @@ pub struct SendRequest {
     pub headers: BTreeMap<String, String>,
     pub priority: i32,
     pub delay: Option<Duration>,
+    /// Optional time-to-live. If the message is not claimed before this
+    /// duration elapses, the sweeper moves it to the DLQ with reason
+    /// `Expired`.
+    pub ttl: Option<Duration>,
 }
 
 impl SendRequest {
@@ -410,6 +455,7 @@ impl SendRequest {
             headers: BTreeMap::new(),
             priority: 0,
             delay: None,
+            ttl: None,
         }
     }
 
@@ -425,6 +471,11 @@ impl SendRequest {
 
     pub fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = Some(delay);
+        self
+    }
+
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
         self
     }
 }

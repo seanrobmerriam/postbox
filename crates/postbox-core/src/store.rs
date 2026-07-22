@@ -23,7 +23,8 @@ use ulid::Ulid;
 
 use crate::error::PostboxError;
 use crate::types::{
-    Claim, DeadLetter, FailureKind, Mailbox, MailboxConfig, Message, PoisonReason, SendRequest,
+    Claim, DeadLetter, FailureKind, FanoutRequest, Mailbox, MailboxConfig, MailboxStats, Message,
+    PoisonReason, SendRequest,
 };
 
 /// Single storage interface every backend implements.
@@ -136,4 +137,43 @@ pub trait MailboxStore: Send + Sync + 'static {
     /// Diagnostic: how many messages are currently pending in `mailbox_id`.
     /// Used by capacity checks and observable in admin tools.
     async fn pending_count(&self, mailbox_id: &str) -> Result<usize, PostboxError>;
+
+    /// Send one message to multiple target mailboxes atomically. If any
+    /// insert fails (capacity, validation) the entire fanout is rolled back.
+    /// Returns the persisted messages (one per target), each with a distinct
+    /// `message_id`.
+    async fn fanout_send(
+        &self,
+        req: FanoutRequest,
+    ) -> Result<Vec<Message>, PostboxError>;
+
+    /// List all mailboxes with cursor-based pagination on `agent_id`.
+    /// `after` is the exclusive cursor (pass the last `agent_id` from the
+    /// previous page, or `None` for the first page).
+    async fn list_mailboxes(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<Vec<Mailbox>, PostboxError>;
+
+    /// Return aggregate counters for a single mailbox.
+    async fn mailbox_stats(
+        &self,
+        agent_id: &str,
+    ) -> Result<MailboxStats, PostboxError>;
+
+    /// Dead-letter all `pending` messages whose `expires_at` has passed.
+    /// Returns the count of messages moved to the DLQ.
+    async fn sweep_expired_messages(
+        &self,
+        now: SystemTime,
+    ) -> Result<usize, PostboxError>;
+
+    /// Delete dead-letter records older than `before` for the given mailbox.
+    /// Returns the number of rows deleted.
+    async fn purge_dead_letters(
+        &self,
+        mailbox_id: &str,
+        before: SystemTime,
+    ) -> Result<usize, PostboxError>;
 }

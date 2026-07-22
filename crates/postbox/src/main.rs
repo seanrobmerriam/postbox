@@ -98,6 +98,9 @@ async fn main() -> Result<()> {
     let config = Config::from_cli(cli)?;
     info!(?config, "postbox starting");
 
+    // Initialize Prometheus metrics recorder.
+    let _prometheus_handle = postbox_grpc::init_prometheus();
+
     // Validate config up front so we fail fast with a clear message.
     if config.http.is_none() && config.grpc.is_none() && !config.run_mcp_stdio {
         anyhow::bail!(

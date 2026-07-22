@@ -38,6 +38,7 @@ async fn grpc_send_claim_commit_full_lifecycle() {
         max_attempts: 5,
         lease_duration_ms: 30_000,
         max_payload_bytes: 1024,
+        dlq_retention_ms: 0,
     };
     let resp = client
         .ensure_mailbox(postbox_grpc::grpc::proto::EnsureMailboxRequest {
@@ -47,6 +48,7 @@ async fn grpc_send_claim_commit_full_lifecycle() {
             max_attempts: 5,
             lease_duration_ms: 30_000,
             max_payload_bytes: 1024,
+            dlq_retention_ms: 0,
         })
         .await
         .unwrap();
@@ -61,6 +63,7 @@ async fn grpc_send_claim_commit_full_lifecycle() {
             headers: None,
             priority: 0,
             delay_ms: 0,
+            ttl_ms: 0,
         })
         .await
         .unwrap();
@@ -104,6 +107,7 @@ async fn grpc_commit_with_empty_checkpoint_token_fails() {
             max_attempts: 5,
             lease_duration_ms: 30_000,
             max_payload_bytes: 1024,
+            dlq_retention_ms: 0,
         })
         .await
         .unwrap();
@@ -115,6 +119,7 @@ async fn grpc_commit_with_empty_checkpoint_token_fails() {
             headers: None,
             priority: 0,
             delay_ms: 0,
+            ttl_ms: 0,
         })
         .await
         .unwrap();
@@ -136,4 +141,246 @@ async fn grpc_commit_with_empty_checkpoint_token_fails() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+// --- Tests for the new RPCs (FEATURES 3, 4, 6, 7) ------------------------
+
+#[tokio::test]
+async fn grpc_fanout_creates_one_message_per_target() {
+    use postbox_grpc::grpc::proto::Headers as GrpcHeaders;
+    let endpoint = spawn_server().await;
+    let mut client = PostboxServiceClient::connect(endpoint).await.unwrap();
+
+    for a in ["alice", "bob", "carol"] {
+        client
+            .ensure_mailbox(postbox_grpc::grpc::proto::EnsureMailboxRequest {
+                agent_id: a.into(),
+                capacity: 10,
+                ordering_mode: "fifo".into(),
+                max_attempts: 5,
+                lease_duration_ms: 30_000,
+                max_payload_bytes: 1024,
+                dlq_retention_ms: 0,
+            })
+            .await
+            .unwrap();
+    }
+
+    let resp = client
+        .fanout(postbox_grpc::grpc::proto::FanoutSendRequest {
+            targets: vec!["alice".into(), "bob".into(), "carol".into()],
+            from_agent: "ops".into(),
+            payload: b"broadcast".to_vec(),
+            headers: Some(GrpcHeaders { entries: Default::default() }),
+            priority: 0,
+            delay_ms: 0,
+            ttl_ms: 0,
+        })
+        .await
+        .unwrap();
+    let msgs = resp.into_inner().messages;
+    assert_eq!(msgs.len(), 3);
+    let ids: std::collections::HashSet<_> = msgs.iter().map(|m| m.message_id.clone()).collect();
+    assert_eq!(ids.len(), 3, "expected distinct ids, got {ids:?}");
+}
+
+#[tokio::test]
+async fn grpc_list_mailboxes_returns_paginated() {
+    let endpoint = spawn_server().await;
+    let mut client = PostboxServiceClient::connect(endpoint).await.unwrap();
+
+    for a in ["alpha", "bravo", "charlie"] {
+        client
+            .ensure_mailbox(postbox_grpc::grpc::proto::EnsureMailboxRequest {
+                agent_id: a.into(),
+                capacity: 1,
+                ordering_mode: "fifo".into(),
+                max_attempts: 5,
+                lease_duration_ms: 30_000,
+                max_payload_bytes: 1024,
+                dlq_retention_ms: 0,
+            })
+            .await
+            .unwrap();
+    }
+
+    let resp = client
+        .list_mailboxes(postbox_grpc::grpc::proto::ListMailboxesRequest {
+            limit: 2,
+            after: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.mailboxes.len(), 2);
+    assert_eq!(resp.mailboxes[0].agent_id, "alpha");
+    assert_eq!(resp.mailboxes[1].agent_id, "bravo");
+
+    let resp = client
+        .list_mailboxes(postbox_grpc::grpc::proto::ListMailboxesRequest {
+            limit: 10,
+            after: "bravo".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.mailboxes.len(), 1);
+    assert_eq!(resp.mailboxes[0].agent_id, "charlie");
+}
+
+#[tokio::test]
+async fn grpc_get_mailbox_stats_returns_counters() {
+    let endpoint = spawn_server().await;
+    let mut client = PostboxServiceClient::connect(endpoint).await.unwrap();
+    client
+        .ensure_mailbox(postbox_grpc::grpc::proto::EnsureMailboxRequest {
+            agent_id: "q".into(),
+            capacity: 10,
+            ordering_mode: "fifo".into(),
+            max_attempts: 5,
+            lease_duration_ms: 30_000,
+            max_payload_bytes: 1024,
+            dlq_retention_ms: 0,
+        })
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        client
+            .send_message(postbox_grpc::grpc::proto::SendMessageRequest {
+                to_agent: "q".into(),
+                from_agent: "a".into(),
+                payload: b"x".to_vec(),
+                headers: None,
+                priority: 0,
+                delay_ms: 0,
+                ttl_ms: 0,
+            })
+            .await
+            .unwrap();
+    }
+    let stats = client
+        .get_mailbox_stats(postbox_grpc::grpc::proto::GetMailboxStatsRequest {
+            agent_id: "q".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .stats
+        .unwrap();
+    assert_eq!(stats.pending_count, 2);
+    assert_eq!(stats.claimed_count, 0);
+}
+
+#[tokio::test]
+async fn grpc_purge_dead_letters_returns_count() {
+    let endpoint = spawn_server().await;
+    let mut client = PostboxServiceClient::connect(endpoint).await.unwrap();
+    client
+        .ensure_mailbox(postbox_grpc::grpc::proto::EnsureMailboxRequest {
+            agent_id: "q".into(),
+            capacity: 10,
+            ordering_mode: "fifo".into(),
+            max_attempts: 5,
+            lease_duration_ms: 30_000,
+            max_payload_bytes: 1024,
+            dlq_retention_ms: 0,
+        })
+        .await
+        .unwrap();
+    let resp = client
+        .send_message(postbox_grpc::grpc::proto::SendMessageRequest {
+            to_agent: "q".into(),
+            from_agent: "a".into(),
+            payload: b"x".to_vec(),
+            headers: None,
+            priority: 0,
+            delay_ms: 0,
+            ttl_ms: 0,
+        })
+        .await
+        .unwrap();
+    let mid = resp.into_inner().message.unwrap().message_id;
+    client
+        .claim(postbox_grpc::grpc::proto::ClaimRequest {
+            agent_id: "q".into(),
+            claimer_id: "w".into(),
+            lease_duration_ms: 30_000,
+        })
+        .await
+        .unwrap();
+    client
+        .release(postbox_grpc::grpc::proto::ReleaseRequest {
+            message_id: mid,
+            claimer_id: "w".into(),
+            kind: "permanent".into(),
+            note: String::new(),
+        })
+        .await
+        .unwrap();
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    let resp = client
+        .purge_dead_letters(postbox_grpc::grpc::proto::PurgeDeadLettersRequest {
+            agent_id: "q".into(),
+            before_ms: future,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.deleted_count >= 1);
+}
+
+#[tokio::test]
+async fn grpc_stream_claim_pushes_message() {
+    let endpoint = spawn_server().await;
+    let mut client = PostboxServiceClient::connect(endpoint).await.unwrap();
+
+    client
+        .ensure_mailbox(postbox_grpc::grpc::proto::EnsureMailboxRequest {
+            agent_id: "stream".into(),
+            capacity: 10,
+            ordering_mode: "fifo".into(),
+            max_attempts: 5,
+            lease_duration_ms: 30_000,
+            max_payload_bytes: 1024,
+            dlq_retention_ms: 0,
+        })
+        .await
+        .unwrap();
+    client
+        .send_message(postbox_grpc::grpc::proto::SendMessageRequest {
+            to_agent: "stream".into(),
+            from_agent: "sender".into(),
+            payload: b"streamed".to_vec(),
+            headers: None,
+            priority: 0,
+            delay_ms: 0,
+            ttl_ms: 0,
+        })
+        .await
+        .unwrap();
+
+    use futures::StreamExt;
+    let mut stream = client
+        .stream_claim(postbox_grpc::grpc::proto::StreamClaimRequest {
+            agent_id: "stream".into(),
+            claimer_id: "consumer".into(),
+            lease_duration_ms: 30_000,
+            poll_interval_ms: 50,
+            max_messages: 1,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let resp = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .unwrap()
+        .expect("stream produced one item")
+        .unwrap();
+    let msg = resp.claim.unwrap().message.unwrap();
+    assert_eq!(msg.payload, b"streamed");
 }

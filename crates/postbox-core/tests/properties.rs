@@ -42,6 +42,7 @@ async fn run_scenario(
             max_attempts: 3,
             lease_duration: Duration::from_secs(60),
             max_payload_bytes: 1024,
+                dlq_retention: None,
         })
         .await
         .unwrap();
@@ -148,6 +149,7 @@ proptest! {
                 max_attempts: 100,
                 lease_duration: Duration::from_secs(60),
                 max_payload_bytes: 1024,
+                dlq_retention: None,
             }).await.unwrap();
             for a in actions {
                 if let Action::Send(s) = a {
@@ -204,6 +206,7 @@ proptest! {
                 max_attempts: 100,
                 lease_duration: Duration::from_secs(60),
                 max_payload_bytes: 1024,
+                dlq_retention: None,
             }).await.unwrap();
             for i in 0..n_msgs {
                 store.send(SendRequest::new(
@@ -246,6 +249,7 @@ proptest! {
                 max_attempts: 100,
                 lease_duration: Duration::from_millis(50),
                 max_payload_bytes: 1024,
+                dlq_retention: None,
             }).await.unwrap();
             let mut sent = Vec::new();
             for i in 0..n {
@@ -295,6 +299,7 @@ proptest! {
                 max_attempts,
                 lease_duration: Duration::from_secs(60),
                 max_payload_bytes: 1024,
+                dlq_retention: None,
             }).await.unwrap();
             let m = store
                 .send(SendRequest::new("alice", "bob", Bytes::from_static(b"x")))

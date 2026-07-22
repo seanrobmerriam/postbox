@@ -74,6 +74,16 @@ pub fn spawn<S: MailboxStore + 'static>(
                             }
                         }
                     }
+                    // Sweep expired messages (TTL / dead-letter).
+                    match store.sweep_expired_messages(now).await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            debug!(expired = n, "postbox sweeper dead-lettered expired messages");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "postbox sweeper error sweeping expired messages");
+                        }
+                    }
                 }
             }
         }
@@ -121,6 +131,16 @@ pub fn spawn_arc(
                             }
                         }
                     }
+                    // Sweep expired messages (TTL / dead-letter).
+                    match store.sweep_expired_messages(now).await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            debug!(expired = n, "postbox sweeper dead-lettered expired messages");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "postbox sweeper error sweeping expired messages");
+                        }
+                    }
                 }
             }
         }
@@ -153,6 +173,7 @@ mod tests {
                 max_attempts: 10,
                 lease_duration: Duration::from_secs(60),
                 max_payload_bytes: 1024,
+                dlq_retention: None,
             })
             .await
             .unwrap();

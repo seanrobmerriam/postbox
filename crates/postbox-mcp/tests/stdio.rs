@@ -49,6 +49,8 @@ async fn mcp_send_claim_commit_full_lifecycle() {
             headers: Default::default(),
             delay_ms: None,
             from_agent: Some("bob".into()),
+            priority: None,
+            ttl_ms: None,
         }))
         .await
         .unwrap();
@@ -91,6 +93,8 @@ async fn mcp_commit_with_empty_checkpoint_token_fails() {
             headers: Default::default(),
             delay_ms: None,
             from_agent: None,
+            priority: None,
+            ttl_ms: None,
         }))
         .await
         .unwrap();
@@ -127,6 +131,8 @@ async fn mcp_send_claim_release_redeliver_dead_letter() {
             headers: Default::default(),
             delay_ms: None,
             from_agent: None,
+            priority: None,
+            ttl_ms: None,
         }))
         .await
         .unwrap();
@@ -193,6 +199,8 @@ async fn mcp_check_inbox_returns_visible_messages() {
             headers: Default::default(),
             delay_ms: None,
             from_agent: None,
+            priority: None,
+            ttl_ms: None,
         }))
         .await
         .unwrap();
@@ -228,6 +236,8 @@ async fn mcp_read_pending_resource_returns_visible_messages() {
             headers: Default::default(),
             delay_ms: None,
             from_agent: None,
+            priority: None,
+            ttl_ms: None,
         }))
         .await
         .unwrap();
@@ -271,3 +281,171 @@ async fn mcp_get_info_advertises_tools_and_resources() {
         "resources capability advertised"
     );
 }
+
+// --- Tests for new MCP tools (FEATURES 3, 4, 6) --------------------------
+
+#[tokio::test]
+async fn mcp_fanout_message_creates_one_per_target() {
+    let server = PostboxMcp::new(store());
+    for a in ["alice", "bob", "carol"] {
+        server
+            .store_ensure(a)
+            .await;
+    }
+    let payload_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"x");
+    let r = server
+        .fanout_message(Parameters(postbox_mcp::server::FanoutMessageArgs {
+            targets: vec!["alice".into(), "bob".into(), "carol".into()],
+            from_agent: "ops".into(),
+            payload_base64: payload_b64,
+            headers: Default::default(),
+            priority: None,
+            delay_ms: None,
+            ttl_ms: None,
+        }))
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&first_text(&r)).unwrap();
+    let msgs = body["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3);
+}
+
+#[tokio::test]
+async fn mcp_fanout_rejects_invalid_target() {
+    let server = PostboxMcp::new(store());
+    let payload_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"x");
+    let err = server
+        .fanout_message(Parameters(postbox_mcp::server::FanoutMessageArgs {
+            targets: vec!["alice".into(), "bad agent id".into()],
+            from_agent: "ops".into(),
+            payload_base64: payload_b64,
+            headers: Default::default(),
+            priority: None,
+            delay_ms: None,
+            ttl_ms: None,
+        }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("invalid"));
+}
+
+#[tokio::test]
+async fn mcp_list_mailboxes_returns_advertised_mailboxes() {
+    let server = PostboxMcp::new(store());
+    server.store_ensure("alpha").await;
+    server.store_ensure("bravo").await;
+    let r = server
+        .list_mailboxes(Parameters(postbox_mcp::server::ListMailboxesArgs {
+            limit: Some(10),
+            after: None,
+        }))
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&first_text(&r)).unwrap();
+    let arr = body["mailboxes"].as_array().unwrap();
+    assert!(arr.len() >= 2);
+}
+
+#[tokio::test]
+async fn mcp_mailbox_stats_returns_counters() {
+    let server = PostboxMcp::new(store());
+    server.store_ensure("q").await;
+    let payload_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"x");
+    let _ = server
+        .send_message(Parameters(postbox_mcp::server::SendMessageArgs {
+            to_agent: "q".into(),
+            payload_base64: payload_b64,
+            headers: Default::default(),
+            delay_ms: None,
+            from_agent: None,
+            priority: None,
+            ttl_ms: None,
+        }))
+        .await
+        .unwrap();
+    let r = server
+        .mailbox_stats(Parameters(postbox_mcp::server::MailboxStatsArgs {
+            agent_id: "q".into(),
+        }))
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&first_text(&r)).unwrap();
+    assert_eq!(body["pending_count"], 1);
+    assert_eq!(body["claimed_count"], 0);
+}
+
+#[tokio::test]
+async fn mcp_purge_dead_letters_returns_count() {
+    let server = PostboxMcp::new(store());
+    server.store_ensure("q").await;
+    let payload_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"x");
+    // Send + permanent release to seed DLQ.
+    let r = server
+        .send_message(Parameters(postbox_mcp::server::SendMessageArgs {
+            to_agent: "q".into(),
+            payload_base64: payload_b64,
+            headers: Default::default(),
+            delay_ms: None,
+            from_agent: None,
+            priority: None,
+            ttl_ms: None,
+        }))
+        .await
+        .unwrap();
+    let mid = serde_json::from_str::<serde_json::Value>(&first_text(&r))
+        .unwrap()["message_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = server
+        .claim_message(Parameters(postbox_mcp::server::ClaimMessageArgs {
+            agent_id: "q".into(),
+            claimer_id: "w".into(),
+            lease_duration_ms: None,
+        }))
+        .await
+        .unwrap();
+    let _ = server
+        .release_message(Parameters(postbox_mcp::server::ReleaseMessageArgs {
+            message_id: mid.clone(),
+            claimer_id: "w".into(),
+            failure_kind: "permanent".into(),
+            note: None,
+        }))
+        .await
+        .unwrap();
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    let r = server
+        .purge_dead_letters(Parameters(postbox_mcp::server::PurgeDeadLettersArgs {
+            mailbox_id: "q".into(),
+            before_ms: future,
+        }))
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&first_text(&r)).unwrap();
+    assert!(body["deleted_count"].as_u64().unwrap() >= 1);
+    let _ = mid;
+}
+
+// Helper trait to make tests more concise — wraps `ensure_mailbox` directly.
+mod helpers {
+    use super::PostboxMcp;
+    use postbox_core::MailboxConfig;
+    pub(super) trait StoreEnsure {
+        async fn store_ensure(&self, agent_id: &str) -> ();
+    }
+    impl StoreEnsure for PostboxMcp {
+        async fn store_ensure(&self, agent_id: &str) -> () {
+            let _ = self
+                .store
+                .ensure_mailbox(MailboxConfig::defaults_for(agent_id))
+                .await
+                .unwrap();
+        }
+    }
+}
+use helpers::StoreEnsure;
