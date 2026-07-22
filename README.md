@@ -275,14 +275,6 @@ Tests are split across the four crates:
 - Property tests under `tests/properties.rs` stress the inbox / claim /
   commit / release lifecycle with proptest.
 
-## Roadmap
-
-`FEATURE_PLAN.md` documents the design decisions for upcoming work. Items
-1 through 7 (priority ordering, TTL, fanout, admin API, Prometheus, DLQ
-retention, gRPC streaming claim) are implemented in this revision. Item 8
-— a Postgres-backed store behind a `postgres` Cargo feature — is the next
-milestone.
-
 ## License
 
 MIT OR Apache-2.0
